@@ -1,0 +1,36 @@
+# Local schema workbooks and row-level user metadata
+*.xlsx
+*.xls
+month_mytv_info.parquet
+
+# Raw/source input data
+data/data/behavior/
+data/data/content_tags/
+data/data/duration/
+data/data/mytv_vmp_content/
+data/data/tags/
+data/data/month_mytv_info.parquet
+
+# Generated model and run artifacts
+data/data/model/
+data/data/canonical/
+data/data/metrics/
+*/train_data/
+*/infer_data/
+*/merged_duration/
+*/result/
+*/result_v2/
+*/result_v3/
+*/result_v3_fcn/
+.venv/
+
+# Local pytest/runtime caches
+.pytest_cache/
+.pytest_tmp/
+.pytest_cache_run/
+pytest-cache-files-*/
+__pycache__/
+
+# Transient experiment process logs
+*.stdout.log
+*.stderr.log
