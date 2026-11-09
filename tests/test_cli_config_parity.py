@@ -214,6 +214,8 @@ _LIVE_TEST_FLAGS = {
     "candidate_rules",
     "reserved_per_rule",
     "source_candidates_per_rule",
+    "gbdt_backend",
+    "gbdt_device",
 }
 
 
@@ -245,6 +247,8 @@ _COMPARABILITY_CONFIG = (
     "candidate_rules",
     "reserved_per_rule",
     "source_candidates_per_rule",
+    "gbdt_backend",
+    "gbdt_device",
 )
 
 
@@ -424,3 +428,22 @@ def test_evaluation_scores_the_retrieval_serving_uses():
         option = "--" + name.replace("_", "-")
         for operation, options in domain.items():
             assert options[option].default == live[name], (operation, name)
+
+
+def test_the_scorer_backend_reaches_every_run_that_fits_a_scorer(monkeypatch):
+    """GPU training must be selectable wherever a scorer is fitted."""
+
+    for target, argv in (
+        ("evaluate_popularity_baseline", ["evaluate-baseline"]),
+        ("evaluate_temporal_model", ["evaluate"]),
+        ("popularity_live_test", ["live-test"]),
+    ):
+        captured = _forwarded(monkeypatch, target, [*argv, "--gbdt-backend", "xgboost", "--gbdt-device", "cpu"])
+        assert (captured.get("gbdt_backend"), captured.get("gbdt_device")) == ("xgboost", "cpu"), target
+
+
+def test_neural_evaluation_scores_the_retrieval_serving_uses(monkeypatch):
+    live = _subcommand_defaults("live-test")
+    captured = _forwarded(monkeypatch, "evaluate_temporal_model", ["evaluate"])
+    for name in ("recency_candidates_per_rule", "recency_reserved_per_rule", "recency_max_age_days"):
+        assert captured.get(name) == live[name], name

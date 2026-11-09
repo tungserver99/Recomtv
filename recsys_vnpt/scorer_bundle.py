@@ -39,13 +39,24 @@ class BundleError(RuntimeError):
     """A bundle is missing, corrupt, or incompatible with this environment."""
 
 
+def _xgboost_version() -> str | None:
+    try:
+        import xgboost
+    except ImportError:
+        return None
+    return xgboost.__version__
+
+
 def _library_versions() -> dict[str, str]:
-    return {
+    versions = {
         "python": platform.python_version(),
         "scikit-learn": sklearn.__version__,
         "numpy": np.__version__,
         "pandas": pd.__version__,
     }
+    if _xgboost_version() is not None:
+        versions["xgboost"] = _xgboost_version()
+    return versions
 
 
 def save_bundle(
@@ -111,6 +122,15 @@ def load_bundle(
         raise BundleError(
             f"bundle was trained with scikit-learn {trained_with}, this environment "
             f"has {sklearn.__version__}; retrain under the serving environment"
+        )
+    uses_xgboost = "xgboost" in (
+        manifest.get("rule_scorer", {}).get("rule_scorer_backend"),
+        manifest.get("content_scorer", {}).get("content_scorer_backend"),
+    )
+    if uses_xgboost and manifest["libraries"].get("xgboost") != _xgboost_version():
+        raise BundleError(
+            f"bundle was trained with xgboost {manifest['libraries'].get('xgboost')}, this environment "
+            f"has {_xgboost_version()}; retrain under the serving environment"
         )
     payload = joblib.load(model_path)
     return payload["rule"], payload["content"], manifest

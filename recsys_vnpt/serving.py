@@ -389,6 +389,8 @@ def serving_manifest_config(
     candidate_rules,
     reserved_per_rule,
     source_candidates_per_rule,
+    gbdt_backend,
+    gbdt_device,
 ) -> dict[str, Any]:
     """The config a serving run writes into its own manifest.
 
@@ -419,6 +421,8 @@ def serving_manifest_config(
         "candidate_rules": candidate_rules,
         "reserved_per_rule": reserved_per_rule,
         "source_candidates_per_rule": source_candidates_per_rule,
+        "gbdt_backend": gbdt_backend,
+        "gbdt_device": gbdt_device,
     }
 
 
@@ -454,6 +458,8 @@ def popularity_live_test(
     candidate_rules: int = 40,
     reserved_per_rule: int = 10,
     source_candidates_per_rule: int = 20,
+    gbdt_backend: str = "sklearn",
+    gbdt_device: str = "auto",
 ) -> MetricBundle:
     """Serve ``num_profiles`` profiles (0 serves all of them) and record metrics.
 
@@ -509,7 +515,9 @@ def popularity_live_test(
     rule_model = content_model = None
     if rule_ordering == "learned_rrf":
         try:
-            rule_model = train_rule_scorer(context.canonical, loader)
+            rule_model = train_rule_scorer(
+                context.canonical, loader, backend=gbdt_backend, device=gbdt_device
+            )
         except Exception as error:  # noqa: BLE001 - enhancer must never kill publish
             fallback_metrics.update(
                 {
@@ -521,7 +529,9 @@ def popularity_live_test(
         raise ValueError(f"unsupported rule ordering: {rule_ordering}")
     if content_ordering == "learned_rrf":
         try:
-            content_model = train_content_scorer(context.canonical, cutoff, loader)
+            content_model = train_content_scorer(
+                context.canonical, cutoff, loader, backend=gbdt_backend, device=gbdt_device
+            )
         except Exception as error:  # noqa: BLE001 - enhancer must never kill publish
             fallback_metrics.update(
                 {
@@ -1028,6 +1038,8 @@ def popularity_live_test(
                 candidate_rules=candidate_rules,
                 reserved_per_rule=reserved_per_rule,
                 source_candidates_per_rule=source_candidates_per_rule,
+                gbdt_backend=gbdt_backend,
+                gbdt_device=gbdt_device,
             ),
         )
         bundle = MetricBundle(

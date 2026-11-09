@@ -1,7 +1,7 @@
 # Yêu cầu sản phẩm — RecSys-VNPT
 
 Những gì hệ thống gợi ý trang chủ MyTV phải giao, và các ràng buộc hệ thống phải
-tuân theo. Thiết kế kỹ thuật nằm trong `ARCHITECTURE.md`, bằng chứng đo lường
+tuân theo. Thiết kế kỹ thuật nằm trong `ARCHITECTURE.md`, định nghĩa chỉ số
 trong `METRICS.md`, vận hành trong `OPERATIONS.md`, các bước tích hợp cho VNPT
 trong `TODO.md`.
 
@@ -76,19 +76,16 @@ chỉ xuất hiện lúc ghi file.
 VNPT yêu cầu một nội dung không lặp lại giữa các hàng, vì sự lặp lại hiện ra ngay
 trên màn hình. Mặc định khi phục vụ là khử trùng lặp (de-duplication) trên toàn
 trang theo chiều sâu: mọi hàng lấy nội dung tốt nhất còn lại của mình trước khi
-bất kỳ hàng nào lấy nội dung thứ hai. Trên toàn bộ dữ liệu, cách này chỉ còn 28
-slot trùng trong khoảng 21 triệu slot (39,509 profile).
+bất kỳ hàng nào lấy nội dung thứ hai.
 
 Có một ngoại lệ bắt buộc: hàng hết candidate mới trước khi đủ 10 nội dung được
 phép dùng lại nội dung đã đặt ở hàng khác. **Mức sàn 10 nội dung là cứng; khử
 trùng lặp chỉ thực hiện ở mức tốt nhất có thể.** Toàn bộ phần trùng lặp còn lại
 đến từ ngoại lệ này.
 
-Sự đánh đổi này có thật và đã được đo: khử trùng lặp làm tăng độ phủ của trang và
-số nội dung khác nhau, nhưng làm giảm chỉ số thứ tự trong hàng. Hãy đọc mục "Cách
-đọc Content NDCG" của `METRICS.md` trước khi rút ra kết luận từ mức giảm đó: chỉ
-số này tính điểm một nội dung đã xem một lần cho mỗi hàng chứa nó, nên thưởng
-đúng cho sự lặp lại đang bị loại bỏ.
+Khi so sánh các chính sách khử trùng lặp, cần lưu ý `macro_content_ndcg@10` tính
+điểm một nội dung đã xem một lần cho mỗi hàng chứa nó, nên chỉ số này giảm khi bỏ
+lặp; nên dùng thêm các chỉ số đếm một lần như `overall_recall@page`.
 
 ## 4. Dữ liệu hệ thống cần
 

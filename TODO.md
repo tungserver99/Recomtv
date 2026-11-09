@@ -69,6 +69,5 @@ dữ liệu upstream, lập lịch và nghiệm thu. Mỗi bước đều trỏ 
   hạng offline không phải CTR hay mức tăng thời lượng xem, và chưa thể khẳng định
   hai chỉ số đó cho đến khi có luồng này.
 - [ ] **Dữ liệu theo thời điểm.** Cung cấp snapshot có ngày của thành viên rule và
-  metadata nội dung. Hiện cả hai đều được điền ngược từ một snapshot muộn hơn, đây
-  là lý do chính khiến retrieval chưa thể đạt gate recall 0.98 (`METRICS.md`, mục
-  "Dư địa cải thiện chất lượng").
+  metadata nội dung. Hiện cả hai được điền ngược từ một snapshot muộn hơn, nên
+  retrieval và đánh giá chưa phản ánh đúng dữ liệu tại từng thời điểm.

@@ -7,6 +7,7 @@ from recsys_vnpt.engagement import (
     DEFAULT_SESSION_GAP_MINUTES,
     DEFAULT_TARGET_VERSION,
 )
+from recsys_vnpt.gbdt import GBDT_BACKENDS, GBDT_DEVICES
 from recsys_vnpt.implicit_baselines import IMPLICIT_BASELINE_FAMILIES
 from recsys_vnpt.rule_assembly import PAGE_DEDUP_POLICIES
 
@@ -64,6 +65,14 @@ def _add_scoring_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--max-eval-profiles", type=int)
     parser.add_argument("--eval-profile-seed", type=int, default=42)
+    _add_gbdt_arguments(parser)
+
+
+def _add_gbdt_arguments(parser: argparse.ArgumentParser) -> None:
+    """Library and device of the learned scorers, wherever a run fits them."""
+
+    parser.add_argument("--gbdt-backend", choices=GBDT_BACKENDS, default="sklearn")
+    parser.add_argument("--gbdt-device", choices=GBDT_DEVICES, default="auto")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -206,6 +215,9 @@ def main(argv: list[str] | None = None) -> int:
         "--sequence-mode", choices=("none", "historical"), default="none"
     )
     evaluate.add_argument("--sequence-epochs", type=int, default=3)
+    evaluate.add_argument("--recency-candidates-per-rule", type=int, default=8)
+    evaluate.add_argument("--recency-reserved-per-rule", type=int, default=8)
+    evaluate.add_argument("--recency-max-age-days", type=int, default=30)
     _add_scoring_arguments(evaluate)
 
     live = sub.add_parser("live-test")
@@ -259,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     live.add_argument("--candidate-rules", type=int, default=30)
     live.add_argument("--reserved-per-rule", type=int, default=33)
     live.add_argument("--source-candidates-per-rule", type=int, default=33)
+    _add_gbdt_arguments(live)
 
     args = parser.parse_args(argv)
     if args.command == "prepare":
@@ -353,6 +366,8 @@ def main(argv: list[str] | None = None) -> int:
             recency_max_age_days=args.recency_max_age_days,
             cowatch_candidates_per_rule=args.cowatch_candidates_per_rule,
             tag_candidates_per_rule=args.tag_candidates_per_rule,
+            gbdt_backend=args.gbdt_backend,
+            gbdt_device=args.gbdt_device,
             candidate_rules=args.candidate_rules,
             reserved_per_rule=args.reserved_per_rule,
             source_candidates_per_rule=args.source_candidates_per_rule,
@@ -410,6 +425,11 @@ def main(argv: list[str] | None = None) -> int:
             evaluation_split=args.evaluation_split,
             maximum_evaluation_profiles=args.max_eval_profiles,
             evaluation_profile_seed=args.eval_profile_seed,
+            recency_candidates_per_rule=args.recency_candidates_per_rule,
+            recency_reserved_per_rule=args.recency_reserved_per_rule,
+            recency_max_age_days=args.recency_max_age_days,
+            gbdt_backend=args.gbdt_backend,
+            gbdt_device=args.gbdt_device,
             candidate_rules=args.candidate_rules,
             reserved_per_rule=args.reserved_per_rule,
             source_candidates_per_rule=args.source_candidates_per_rule,
@@ -480,6 +500,8 @@ def main(argv: list[str] | None = None) -> int:
             candidate_rules=args.candidate_rules,
             reserved_per_rule=args.reserved_per_rule,
             source_candidates_per_rule=args.source_candidates_per_rule,
+            gbdt_backend=args.gbdt_backend,
+            gbdt_device=args.gbdt_device,
         )
         print(json.dumps({"run_id": bundle.manifest.run_id, "inference": bundle.inference, "output": bundle.output}, indent=2))
     return 0

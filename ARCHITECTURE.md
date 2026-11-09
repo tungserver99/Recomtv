@@ -2,7 +2,7 @@
 
 Cách hệ thống gợi ý không tuần tự (non-sequential) của MyTV được xây dựng. Yêu cầu
 và hợp đồng với client nằm trong `PRD.md`; đặc tả chi tiết từng phần (feature,
-hyperparameter, công thức) trong `SPEC.md`; định nghĩa chỉ số và kết quả đo trong
+hyperparameter, công thức) trong `SPEC.md`; định nghĩa chỉ số trong
 `METRICS.md`; vận hành production trong `OPERATIONS.md`.
 
 ## Luồng xử lý
@@ -114,13 +114,10 @@ retrieval thu hẹp xuống tối đa 1,000 nội dung mỗi profile.
    các nội dung trong rule (chuẩn hóa về [0, 1]) cộng log1p của số sự kiện
    profile–rule trong quá khứ.
 2. Chọn `candidate_rules` rule đứng đầu (30 khi phục vụ), giữ chỗ
-   `reserved_per_rule` nội dung trong mỗi rule (33). Với cùng một ngân sách, lấy
-   ít rule hơn nhưng sâu hơn tìm được nhiều nội dung mà profile sẽ xem hơn so với
-   40 × 10.
+   `reserved_per_rule` nội dung trong mỗi rule (33).
 3. Gộp các kênh theo rule: độ phổ biến, co-watch từ các profile có lịch sử chồng
    lấn, và kênh recency giữ chỗ cho 8 nội dung mới nhất của mỗi rule (cửa sổ 30
-   ngày). Kênh tag-affinity có sẵn nhưng đang tắt: kênh này chiếm chỗ của các slot
-   phổ biến sâu hơn và làm giảm recall.
+   ngày). Kênh tag-affinity có sẵn nhưng mặc định tắt.
 4. Hợp các kênh được lấp đầy tới `candidate_budget` (1,000) nội dung khác nhau.
 
 Ràng buộc `candidate_rules × reserved_per_rule ≤ candidate_budget` giới hạn phần
@@ -140,7 +137,8 @@ final = rule_score + rank(incumbent formula) + w · rank(learned scorer)
 
 Công thức incumbent là `normalised popularity + tag affinity + co-watch`; khi
 phục vụ, kênh tag tắt nên thành phần tag affinity bằng 0. Scorer
-học được gồm hai head `HistGradientBoosting` trên các gain có phân cấp, huấn luyện
+học được gồm hai head gradient boosting (scikit-learn, hoặc XGBoost chạy được trên
+GPU) trên các gain có phân cấp, huấn luyện
 trên các cửa sổ hoàn toàn trước cutoff, và dùng những feature mà incumbent chưa
 từng có: metadata nội dung đọc trực tiếp từ catalog canonical, cộng các feature
 chéo user×item (tag affinity có idf, affinity theo category và theo family).
@@ -151,13 +149,11 @@ Hai điểm thiết kế quan trọng:
   toán trong phạm vi một hàng; nếu xếp hạng trên toàn bộ profile, phần đuôi của
   một hàng mạnh sẽ vượt lên phần đầu của một hàng yếu.
 - **Sampler lấy negative từ nhóm phổ biến nhất trong chính rule của positive**
-  (`rule_head`). Huấn luyện trên đúng phân phối mà mô hình sẽ xếp hạng tốt hơn hẳn
-  so với lấy mẫu hard negative: hard negative khớp theo dải phổ biến đo được thấp
-  hơn 31% so với chỉ dùng độ phổ biến.
+  (`rule_head`), để dữ liệu huấn luyện có cùng phân phối với pool mà mô hình sẽ
+  xếp hạng.
 
 Thứ tự rule dùng cùng dạng kết hợp ở cấp hàng. Vì thành phần điểm rule được giữ
-nguyên, các cải tiến phía nội dung không làm thay đổi thứ tự hàng — đã xác minh
-bằng khoảng tin cậy paired bootstrap đúng bằng `[0, 0]`.
+nguyên, các thay đổi phía nội dung không làm thay đổi thứ tự hàng.
 
 ## Dựng trang
 
@@ -215,10 +211,8 @@ tràn số ở phép đệ quy hàm mũ; không chèn clamp hay chuẩn hóa L2 
 trình gốc. Checkpoint mới dùng schema phiên bản 3 và bị từ chối khi họ mô hình,
 cấu hình hoặc feature contract không khớp.
 
-Luồng neural **không** phải luồng phục vụ. Scorer production là độ phổ biến theo
-rule cộng hai scorer gradient boosting. Lý do đã được đo: bộ dựng feature
-production không tạo ra cột nào thay đổi giữa các candidate của cùng một profile,
-nên mô hình neural không thể xếp hạng trong phạm vi một profile, bất kể kiến trúc.
+Luồng phục vụ hiện dùng độ phổ biến theo rule cộng hai scorer gradient boosting;
+các họ neural ở trên dùng cho nghiên cứu.
 
 ## Hệ thống batch production
 
@@ -245,9 +239,8 @@ hạng catalog và bảng tra co-watch), độ phổ biến của rule, scope c�
 được nạp một lần cho mỗi process dưới dạng `ServingContext`. Khi đó, chi phí của
 một shard chỉ tỷ lệ với số profile của chính nó. Shard được gán theo hash của
 `profile_id`, được kiểm tra đầy đủ, và được ghi với bản ghi thành công ở cuối
-cùng, nên lần chạy lại chỉ làm lại những shard chưa xác minh được. Đã xác minh
-trên toàn bộ dữ liệu: các trang dựng qua ba shard xen kẽ có hash giống hệt một
-lượt chạy duy nhất.
+cùng, nên lần chạy lại chỉ làm lại những shard chưa xác minh được. Cách chia shard
+không ảnh hưởng tới nội dung trang.
 
 **Mỗi output có một điểm commit.** Các shard được gộp bằng cách stream theo thứ tự
 profile; bước này đồng thời từ chối profile bị thiếu, bị lặp hoặc lệch hàng, và

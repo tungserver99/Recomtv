@@ -173,6 +173,8 @@ def _serving_candidates_for_evaluation(
     return_blend_audit: bool = False,
     rule_scorer_model: RuleScorerModel | None = None,
     content_scorer_model: ContentScorerModel | None = None,
+    gbdt_backend: str = "sklearn",
+    gbdt_device: str = "auto",
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
@@ -451,6 +453,8 @@ def _serving_candidates_for_evaluation(
                 interactions_loader=interactions_loader,
                 evaluation_split=evaluation_split,
                 fusion_weight=content_scorer_fusion_weight,
+                backend=gbdt_backend,
+                device=gbdt_device,
             )
         retrieval_metrics.update(content_scorer_metrics)
     elif content_ordering != "hand_sum":
@@ -696,6 +700,8 @@ def _serving_candidates_for_evaluation(
                 interactions_loader=interactions_loader,
                 evaluation_split=evaluation_split,
                 fusion_weight=rule_scorer_fusion_weight,
+                backend=gbdt_backend,
+                device=gbdt_device,
             )
         retrieval_metrics.update(rule_scorer_metrics)
     elif rule_ordering != "count":
@@ -791,6 +797,8 @@ def scoring_manifest_config(
     candidate_rules,
     reserved_per_rule,
     source_candidates_per_rule,
+    gbdt_backend,
+    gbdt_device,
 ) -> dict[str, Any]:
     """The config that decides which page a run was scored on.
 
@@ -815,6 +823,8 @@ def scoring_manifest_config(
         "candidate_rules": candidate_rules,
         "reserved_per_rule": reserved_per_rule,
         "source_candidates_per_rule": source_candidates_per_rule,
+        "gbdt_backend": gbdt_backend,
+        "gbdt_device": gbdt_device,
     }
 
 
@@ -849,6 +859,11 @@ def evaluate_temporal_model(
     candidate_rules: int | None = None,
     reserved_per_rule: int | None = None,
     source_candidates_per_rule: int | None = None,
+    recency_candidates_per_rule: int = 0,
+    recency_reserved_per_rule: int = 0,
+    recency_max_age_days: int = 0,
+    gbdt_backend: str = "sklearn",
+    gbdt_device: str = "auto",
 ) -> MetricBundle:
     root = Path(project_root).resolve()
     model_output = model_artifact_path(domain, "v2", model_family, project_root=root)
@@ -897,6 +912,11 @@ def evaluate_temporal_model(
                     seed=seed,
                 ),
                 evaluation_split=evaluation_split,
+                recency_candidates_per_rule=recency_candidates_per_rule,
+                recency_reserved_per_rule=recency_reserved_per_rule,
+                recency_max_age_days=recency_max_age_days,
+                gbdt_backend=gbdt_backend,
+                gbdt_device=gbdt_device,
                 candidate_rules=candidate_rules,
                 reserved_per_rule=reserved_per_rule,
                 source_candidates_per_rule=source_candidates_per_rule,
@@ -1029,6 +1049,9 @@ def evaluate_temporal_model(
                 "hybrid_embedding_dim": hybrid_embedding_dim,
                 "sequence_mode": sequence_mode,
                 "sequence_epochs": sequence_epochs,
+                "recency_candidates_per_rule": recency_candidates_per_rule,
+                "recency_reserved_per_rule": recency_reserved_per_rule,
+                "recency_max_age_days": recency_max_age_days,
                 **scoring_manifest_config(
                     evaluation_split=evaluation_split,
                     maximum_evaluation_profiles=maximum_evaluation_profiles,
@@ -1045,6 +1068,8 @@ def evaluate_temporal_model(
                     candidate_rules=candidate_rules,
                     reserved_per_rule=reserved_per_rule,
                     source_candidates_per_rule=source_candidates_per_rule,
+                    gbdt_backend=gbdt_backend,
+                    gbdt_device=gbdt_device,
                 ),
             },
         )
@@ -1271,6 +1296,8 @@ def evaluate_popularity_baseline(
     page_dedup: str = "none",
     rule_scorer_model: RuleScorerModel | None = None,
     content_scorer_model: ContentScorerModel | None = None,
+    gbdt_backend: str = "sklearn",
+    gbdt_device: str = "auto",
 ) -> MetricBundle:
     """Offline evaluation of the popularity path on fixed temporal truth.
 
@@ -1354,6 +1381,8 @@ def evaluate_popularity_baseline(
                 return_blend_audit=True,
                 rule_scorer_model=rule_scorer_model,
                 content_scorer_model=content_scorer_model,
+                gbdt_backend=gbdt_backend,
+                gbdt_device=gbdt_device,
             )
         )
     else:
@@ -1531,6 +1560,8 @@ def evaluate_popularity_baseline(
             "contents_per_rule_max": contents_per_rule_max,
             "page_content_budget": page_content_budget,
             "page_dedup": page_dedup,
+            "gbdt_backend": gbdt_backend,
+            "gbdt_device": gbdt_device,
             **asdict(baseline_config),
         },
     )

@@ -84,11 +84,10 @@ def test_architecture_describes_the_pipeline_not_the_product():
         assert token in text, f"ARCHITECTURE.md does not describe: {token}"
 
 
-def test_metrics_warns_how_to_read_content_ndcg():
+def test_metrics_defines_the_primary_metrics():
     text = _text("METRICS.md")
-    assert "Cách đọc Content NDCG" in text
-    assert "0.2292" in text
-    assert "khử trùng lặp" in text
+    for token in ("rule_ndcg@20", "macro_content_ndcg@10", "overall_recall@page", "candidate_recall@1000"):
+        assert token in text, f"METRICS.md does not define {token}"
 
 
 def test_todo_is_the_integration_checklist_for_vnpt():
@@ -97,10 +96,11 @@ def test_todo_is_the_integration_checklist_for_vnpt():
         assert token in text, f"TODO.md does not cover: {token}"
 
 
-def test_metrics_keeps_the_closed_experiments():
-    text = _text("METRICS.md")
-    assert "Thử nghiệm đã đóng" in text
-    assert "candidate_recall@1000" in text
+def test_documents_carry_no_measured_results():
+    """Evaluation results live outside the repository, in .local/."""
+    for name in REQUIRED_DOCS:
+        text = _text(name)
+        assert "Kết quả đo" not in text and "Thử nghiệm đã đóng" not in text, name
 
 
 def test_operations_documents_every_failure_code():

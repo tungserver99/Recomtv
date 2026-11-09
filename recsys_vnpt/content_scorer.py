@@ -1,6 +1,6 @@
 """Learned ordering of content within a rule.
 
-Two ``HistGradientBoostingRegressor`` heads on the graded gains, fitted on
+Two gradient-boosted heads (scikit-learn or XGBoost, see ``gbdt``) on the graded gains, fitted on
 strictly pre-cutoff windows and RRF-fused with the incumbent hand-summed score
 (``popularity + tag + co-watch``) rather than replacing it.
 
@@ -21,8 +21,8 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 from scipy import sparse
-from sklearn.ensemble import HistGradientBoostingRegressor
 
+from recsys_vnpt.gbdt import head_device, make_head
 from recsys_vnpt.temporal import load_temporal_windows
 
 
@@ -628,7 +628,7 @@ INTERACTION_COLUMNS = ["profile_id", "content_id", "create_date"]
 class ContentScorerModel:
     """The two fitted heads and the category coding they were trained with."""
 
-    heads: dict[str, HistGradientBoostingRegressor]
+    heads: dict[str, Any]
     level_maps: dict[str, dict[str, int]]
     metrics: dict[str, Any]
 
@@ -688,6 +688,8 @@ def fit_content_scorer(
     max_leaf_nodes: int = 31,
     min_samples_leaf: int = 50,
     l2_regularization: float = 1.0,
+    backend: str = "sklearn",
+    device: str = "auto",
 ) -> ContentScorerModel:
     """Fit both gain heads on sampled pairs from the temporal windows."""
     event_times = pd.to_datetime(interactions["create_date"], errors="coerce")
@@ -759,23 +761,8 @@ def fit_content_scorer(
             "history overlaps the temporal windows)"
         )
 
-    model_config = {
-        "loss": "squared_error",
-        "learning_rate": learning_rate,
-        "max_iter": max_iter,
-        "max_leaf_nodes": max_leaf_nodes,
-        "min_samples_leaf": min_samples_leaf,
-        "l2_regularization": l2_regularization,
-        "categorical_features": [
-            column in CATEGORICAL_FEATURES for column in FEATURE_COLUMNS
-        ],
-        "early_stopping": True,
-        "validation_fraction": 0.1,
-        "n_iter_no_change": 8,
-        "random_state": seed,
-    }
     x_train = training[list(FEATURE_COLUMNS)].to_numpy(dtype=np.float32)
-    heads: dict[str, HistGradientBoostingRegressor] = {}
+    heads: dict[str, Any] = {}
     fit_metrics: dict[str, Any] = {}
     for gain in GAIN_COLUMNS:
         denominators = (
@@ -785,7 +772,17 @@ def fit_content_scorer(
         )
         target = (training[gain] / denominators).to_numpy(dtype=np.float32)
         weights = np.where(target > 0, observed_weight, 1.0).astype(np.float32)
-        head = HistGradientBoostingRegressor(**model_config)
+        head = make_head(
+            backend,
+            device,
+            [column in CATEGORICAL_FEATURES for column in FEATURE_COLUMNS],
+            seed,
+            learning_rate,
+            max_iter,
+            max_leaf_nodes,
+            min_samples_leaf,
+            l2_regularization,
+        )
         head.fit(x_train, target, sample_weight=weights)
         heads[gain] = head
         fit_metrics[gain] = {
@@ -798,6 +795,8 @@ def fit_content_scorer(
         heads=heads,
         level_maps=level_maps,
         metrics={
+            "content_scorer_backend": backend,
+            "content_scorer_device": head_device(next(iter(heads.values()))),
             "content_scorer_training_windows": [w.name for w in windows],
             "content_scorer_training_rows": int(len(training)),
             "content_scorer_feature_columns": list(FEATURE_COLUMNS),

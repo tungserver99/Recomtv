@@ -8,6 +8,7 @@ from recsys_vnpt.engagement import (
     DEFAULT_SESSION_GAP_MINUTES,
     DEFAULT_TARGET_VERSION,
 )
+from recsys_vnpt.gbdt import GBDT_BACKENDS, GBDT_DEVICES
 from recsys_vnpt.implicit_baselines import IMPLICIT_BASELINE_FAMILIES
 from recsys_vnpt.rule_assembly import PAGE_DEDUP_POLICIES
 from recsys_vnpt.paths import data_artifact_path
@@ -55,6 +56,11 @@ def _add_raw_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--window-mode", choices=("pinned", "relative"), default="pinned"
     )
+
+
+def _add_gbdt_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--gbdt-backend", choices=GBDT_BACKENDS, default="sklearn")
+    parser.add_argument("--gbdt-device", choices=GBDT_DEVICES, default="auto")
 
 
 def _prepare_if_requested(args: argparse.Namespace, domain: str, root: Path) -> None:
@@ -193,6 +199,7 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
         )
         parser.add_argument("--max-eval-profiles", type=int)
         parser.add_argument("--eval-profile-seed", type=int, default=42)
+        _add_gbdt_options(parser)
     elif operation == "infer":
         parser.add_argument("--model-family", choices=("per_rule_popularity", *MODEL_FAMILIES), default="per_rule_popularity")
         parser.add_argument(
@@ -245,6 +252,7 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
         parser.add_argument("--candidate-rules", type=int, default=30)
         parser.add_argument("--reserved-per-rule", type=int, default=33)
         parser.add_argument("--source-candidates-per-rule", type=int, default=33)
+        _add_gbdt_options(parser)
         _add_raw_options(parser)
     else:
         raise ValueError(f"Unsupported domain operation: {operation}")
@@ -331,6 +339,8 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
                 contents_per_rule_max=args.contents_per_rule_max,
                 page_content_budget=args.page_content_budget,
                 page_dedup=args.page_dedup,
+                gbdt_backend=args.gbdt_backend,
+                gbdt_device=args.gbdt_device,
             )
         else:
             bundle = evaluate_temporal_model(
@@ -350,6 +360,11 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
                 sequence_mode=args.sequence_mode,
                 sequence_epochs=args.sequence_epochs,
                 evaluation_split=args.evaluation_split,
+                recency_candidates_per_rule=args.recency_candidates_per_rule,
+                recency_reserved_per_rule=args.recency_reserved_per_rule,
+                recency_max_age_days=args.recency_max_age_days,
+                gbdt_backend=args.gbdt_backend,
+                gbdt_device=args.gbdt_device,
                 candidate_rules=args.candidate_rules,
                 reserved_per_rule=args.reserved_per_rule,
                 source_candidates_per_rule=args.source_candidates_per_rule,
@@ -399,6 +414,8 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
             candidate_rules=args.candidate_rules,
             reserved_per_rule=args.reserved_per_rule,
             source_candidates_per_rule=args.source_candidates_per_rule,
+            gbdt_backend=args.gbdt_backend,
+            gbdt_device=args.gbdt_device,
         )
         payload = {
             "run_id": bundle.manifest.run_id,

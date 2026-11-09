@@ -52,6 +52,7 @@ from recsys_vnpt.export import (
     read_current_delivery,
     serialize_assembled_output,
 )
+from recsys_vnpt.gbdt import serve_on
 from recsys_vnpt.output_validation import validate_client_output
 from recsys_vnpt.paths import data_artifact_path
 from recsys_vnpt.runtime import atomic_write_text
@@ -273,6 +274,8 @@ def _serving_context(config: BatchConfig, bundle: str | None):
     rule_model = content_model = None
     if bundle is not None:
         rule_model, content_model, _ = load_bundle(bundle)
+        serve_on(rule_model, config.gbdt_device)
+        serve_on(content_model, config.gbdt_device)
     context = with_scorers(
         context,
         rule_model if config.rule_ordering == "learned_rrf" else None,
@@ -854,8 +857,13 @@ def run_retrain_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
                 errors="coerce",
             ).max()
             try:
-                rule_model = train_rule_scorer(canonical, loader)
-                content_model = train_content_scorer(canonical, pd.Timestamp(cutoff), loader)
+                rule_model = train_rule_scorer(
+                    canonical, loader, backend=config.gbdt_backend, device=config.gbdt_device
+                )
+                content_model = train_content_scorer(
+                    canonical, pd.Timestamp(cutoff), loader,
+                    backend=config.gbdt_backend, device=config.gbdt_device,
+                )
             except Exception as error:
                 raise BatchError("RETRAIN_FAILED", f"{type(error).__name__}: {error}") from error
             bundle = save_bundle(

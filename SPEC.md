@@ -4,7 +4,7 @@
 model bundle, luồng neural và output. Mỗi mục ghi file và hàm tương ứng ở dòng
 **Code**. Tài liệu này trả lời *hệ thống làm chính xác những gì*; lý do thiết kế
 nằm trong `ARCHITECTURE.md`, hợp đồng với client trong `PRD.md`, vận hành trong
-`OPERATIONS.md`, định nghĩa chỉ số và kết quả đo trong `METRICS.md`.
+`OPERATIONS.md`, định nghĩa chỉ số trong `METRICS.md`.
 
 Các bảng feature, hyperparameter và giá trị mặc định được
 `tests/test_project_documents.py` đối chiếu với code: đổi code mà không sửa tài
@@ -453,6 +453,13 @@ Hai head `HistGradientBoostingRegressor`, một cho `completion_gain` và một 
 | `max_leaf_nodes` | 31 |
 | `min_samples_leaf` | 50 |
 | `l2_regularization` | 1.0 |
+| `backend` | sklearn |
+| `device` | auto |
+
+`backend` chọn thư viện: `sklearn` (`HistGradientBoostingRegressor`, chỉ chạy CPU) hoặc
+`xgboost` (`XGBRegressor`, cây histogram, chạy GPU CUDA khi có). `device` là
+`auto`, `cuda` hoặc `cpu`; `auto` dùng GPU nếu có, mô hình train trên GPU vẫn chấm
+điểm được trên máy chỉ có CPU (`recsys_vnpt/gbdt.py`).
 
 Cố định trong code: loss `squared_error`, early stopping với
 `validation_fraction` 0.1 và `n_iter_no_change` 8, `random_state` = `seed`,
@@ -558,10 +565,11 @@ Fit dừng với lỗi khi:
 | `max_leaf_nodes` | 31 |
 | `min_samples_leaf` | 50 |
 | `l2_regularization` | 1.0 |
+| `backend` | sklearn |
+| `device` | auto |
 
 Cố định trong code: như rule scorer (§6.4), với bốn feature categorical ở §7.2.
-`max_iter` 400 là trần có chủ đích: để early stopping chạy tiếp cho kết quả kém
-hơn, nên trần đóng vai trò regularisation.
+`max_iter` là trần số vòng; early stopping có thể dừng sớm hơn.
 
 ### 7.5 Chấm điểm và kết hợp
 
@@ -692,9 +700,8 @@ Bundle mới đạt khi thỏa mọi điều kiện sau:
 
 **Code:** `feature_contract.py`, `models.py`, `losses.py`, `model_runner.py`.
 
-Luồng này không phục vụ trang: bộ dựng feature của nó không tạo ra cột nào thay
-đổi giữa các candidate của cùng một profile, nên không mô hình nào dùng nó xếp
-hạng được trong phạm vi một profile (`ARCHITECTURE.md`, mục "Họ mô hình").
+Luồng này hiện không được dùng để phục vụ trang (`ARCHITECTURE.md`, mục "Họ mô
+hình").
 
 **`FeatureContract`** được lưu cùng checkpoint và phải được nạp trước khi chấm.
 Các trường:

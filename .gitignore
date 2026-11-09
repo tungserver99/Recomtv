@@ -3,34 +3,40 @@
 *.xls
 month_mytv_info.parquet
 
-# Raw/source input data
-data/data/behavior/
-data/data/content_tags/
-data/data/duration/
-data/data/mytv_vmp_content/
-data/data/tags/
-data/data/month_mytv_info.parquet
+# Raw datasets and generated recommendation outputs
+/data/
+/rs_output/
+/reports/
+/.local/
 
 # Generated model and run artifacts
-data/data/model/
-data/data/canonical/
-data/data/metrics/
-*/train_data/
-*/infer_data/
-*/merged_duration/
-*/result/
-*/result_v2/
-*/result_v3/
-*/result_v3_fcn/
-.venv/
+**/train_data/
+**/infer_data/
+**/merged_duration/
+**/result/
+**/result_v2/
+**/result_v3/
+**/result_v3_fcn/
+**/checkpoints/
+**/runs/
 
-# Local pytest/runtime caches
+# Local environments and Python caches
+.venv/
 .pytest_cache/
 .pytest_tmp/
 .pytest_cache_run/
 pytest-cache-files-*/
 __pycache__/
 
-# Transient experiment process logs
+# Transient logs and temporary files
 *.stdout.log
 *.stderr.log
+*.log
+*.tmp
+*.bak
+*.swp
+
+# OS/editor files and empty scratch notebooks
+.DS_Store
+Thumbs.db
+/Untitled*.ipynb

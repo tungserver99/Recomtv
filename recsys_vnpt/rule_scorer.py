@@ -1,6 +1,6 @@
 """Learned graded rule scorer shared by serving evaluation and experiments.
 
-Fits two HistGradientBoostingRegressor heads (completion/watch-time gain,
+Fits two gradient-boosted heads (scikit-learn or XGBoost, see ``gbdt``) (completion/watch-time gain,
 profile-share target) on pre-cutoff temporal windows from interaction-log
 features only, then RRF-fuses the learned rule ranks with the incumbent
 count-affinity ranks.
@@ -15,9 +15,9 @@ from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingRegressor
 
 from recsys_vnpt.canonical import select_content_metadata_as_of
+from recsys_vnpt.gbdt import head_device, make_head
 from recsys_vnpt.temporal import load_temporal_windows
 
 
@@ -296,7 +296,7 @@ INTERACTION_COLUMNS = ["profile_id", "content_id", "create_date", "duration"]
 class RuleScorerModel:
     """The two fitted heads and the rule coding they were trained with."""
 
-    heads: dict[str, HistGradientBoostingRegressor]
+    heads: dict[str, Any]
     rule_index: pd.DataFrame
     metrics: dict[str, Any]
 
@@ -362,6 +362,8 @@ def fit_rule_scorer(
     max_leaf_nodes: int = 31,
     min_samples_leaf: int = 50,
     l2_regularization: float = 1.0,
+    backend: str = "sklearn",
+    device: str = "auto",
 ) -> RuleScorerModel:
     """Fit both gain heads on the temporal windows."""
     event_times = pd.to_datetime(interactions["create_date"], errors="coerce")
@@ -421,23 +423,8 @@ def fit_rule_scorer(
             "artifacts (pipeline_cli build-temporal --window-mode relative)"
         )
 
-    model_config = {
-        "loss": "squared_error",
-        "learning_rate": learning_rate,
-        "max_iter": max_iter,
-        "max_leaf_nodes": max_leaf_nodes,
-        "min_samples_leaf": min_samples_leaf,
-        "l2_regularization": l2_regularization,
-        "categorical_features": [
-            column == "rule_index" for column in FEATURE_COLUMNS
-        ],
-        "early_stopping": True,
-        "validation_fraction": 0.1,
-        "n_iter_no_change": 8,
-        "random_state": seed,
-    }
     x_train = training[list(FEATURE_COLUMNS)].to_numpy(dtype=np.float32)
-    heads: dict[str, HistGradientBoostingRegressor] = {}
+    heads: dict[str, Any] = {}
     fit_metrics: dict[str, Any] = {}
     for gain in GAIN_COLUMNS:
         if target_normalization == "profile_share":
@@ -448,7 +435,17 @@ def fit_rule_scorer(
         else:
             target = np.log1p(training[gain].to_numpy(dtype=np.float32))
         weights = np.where(target > 0, observed_weight, 1.0).astype(np.float32)
-        head = HistGradientBoostingRegressor(**model_config)
+        head = make_head(
+            backend,
+            device,
+            [column == "rule_index" for column in FEATURE_COLUMNS],
+            seed,
+            learning_rate,
+            max_iter,
+            max_leaf_nodes,
+            min_samples_leaf,
+            l2_regularization,
+        )
         head.fit(x_train, target, sample_weight=weights)
         heads[gain] = head
         fit_metrics[gain] = {
@@ -459,6 +456,8 @@ def fit_rule_scorer(
         heads=heads,
         rule_index=rule_index,
         metrics={
+            "rule_scorer_backend": backend,
+            "rule_scorer_device": head_device(next(iter(heads.values()))),
             "rule_scorer_target_normalization": target_normalization,
             "rule_scorer_training_windows": [w.name for w in windows],
             "rule_scorer_training_rows": int(len(training)),

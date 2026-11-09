@@ -23,6 +23,8 @@
   "content_ordering": "learned_rrf",
   "rule_scorer_fusion_weight": 1.25,
   "content_scorer_fusion_weight": 5.0,
+  "gbdt_backend": "sklearn",
+  "gbdt_device": "auto",
   "contents_per_rule_max": 30,
   "page_content_budget": 600,
   "page_dedup": "balanced_regret",

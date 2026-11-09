@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
+from recsys_vnpt.gbdt import GBDT_BACKENDS, GBDT_DEVICES
 from recsys_vnpt.rule_assembly import PAGE_DEDUP_POLICIES, RuleAssemblyConfig
 from recsys_vnpt.runtime import atomic_write_text
 from recsys_vnpt.source_manifest import sha256_file, stable_hash
@@ -98,6 +99,8 @@ class BatchConfig:
     content_ordering: str = "learned_rrf"
     rule_scorer_fusion_weight: float = 1.25
     content_scorer_fusion_weight: float = 5.0
+    gbdt_backend: str = "sklearn"
+    gbdt_device: str = "auto"
     contents_per_rule_max: int = 30
     page_content_budget: int = 600
     page_dedup: str = "balanced_regret"
@@ -134,6 +137,10 @@ class BatchConfig:
             problems.append("rule_ordering must be count or learned_rrf")
         if self.content_ordering not in {"hand_sum", "learned_rrf"}:
             problems.append("content_ordering must be hand_sum or learned_rrf")
+        if self.gbdt_backend not in GBDT_BACKENDS:
+            problems.append(f"gbdt_backend must be one of {GBDT_BACKENDS}")
+        if self.gbdt_device not in GBDT_DEVICES:
+            problems.append(f"gbdt_device must be one of {GBDT_DEVICES}")
         if self.rule_scorer_fusion_weight <= 0 or self.content_scorer_fusion_weight <= 0:
             problems.append("fusion weights must be positive")
         if not 0 <= self.gate_max_regression < 1:

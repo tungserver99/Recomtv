@@ -129,6 +129,7 @@ mẫu đầy đủ.
 | `recency_candidates_per_rule`, `recency_reserved_per_rule`, `recency_max_age_days` | 8, 8, 30 | kênh retrieval recency: các nội dung mới nhất của mỗi rule, được giữ chỗ trong pool |
 | `rule_ordering`, `content_ordering` | `learned_rrf` | `count`/`hand_sum` phục vụ thứ tự heuristic và không cần bundle |
 | `rule_scorer_fusion_weight`, `content_scorer_fusion_weight` | 1.25, 5.0 | trọng số RRF của từng scorer học được |
+| `gbdt_backend`, `gbdt_device` | `sklearn`, `auto` | thư viện của hai scorer (`sklearn` chỉ chạy CPU; `xgboost` chạy GPU CUDA) và thiết bị (`auto`, `cuda`, `cpu`); `auto` dùng GPU nếu có |
 | `contents_per_rule_max`, `page_content_budget` | 30, 600 | trần mỗi hàng và ngân sách toàn trang |
 | `page_dedup` | `balanced_regret` | chính sách khử trùng lặp toàn trang |
 | `gid` | 3 | nhóm A/B ghi vào file grouping cho đến khi VNPT định nghĩa |
@@ -230,14 +231,14 @@ trỏ tới.
 
 Trang của mỗi profile độc lập với mọi profile khác, nên tập profile được chia
 thành các shard và các byte được giao giống hệt nhau với mọi giá trị `num_shards`
-và `workers`; điều này đã được xác minh bằng bộ test và trên toàn bộ dữ liệu.
+và `workers`; bộ test kiểm tra tính chất này.
 
 Bộ nhớ của mỗi worker gồm serving context (catalog, lịch sử trước cutoff, bảng tra
 co-watch, cả hai scorer) cộng với candidate của một shard, khoảng 1,000 dòng cho
 mỗi profile. Tăng `num_shards` cho đến khi một shard vừa bộ nhớ; tăng `workers`
 cho đến khi hết core hoặc hết bộ nhớ: mỗi worker giữ context riêng, nên bộ nhớ
-tăng theo `workers`. Bước qualification trên máy chủ production sẽ chọn cả hai giá
-trị.
+tăng theo `workers`. Ở quy mô dữ liệu hiện tại, mỗi worker cần khoảng 4.5 GB RAM.
+Bước qualification trên máy chủ production sẽ chọn cả hai giá trị.
 
 Giới hạn cần theo dõi là context: context giữ toàn bộ lịch sử trước cutoff và bảng
 tra co-watch, nên tăng theo quy mô tập profile chứ không theo shard. Nếu
@@ -249,33 +250,6 @@ khi bổ sung phần cứng.
 profile), các shard chiếm thêm chừng ấy cho đến khi được dọn, và mỗi đầu vào khác
 nhau tạo thêm artifact canonical trong `work/artifacts/` (1.8 GB với đầu vào hiện
 tại 6.2 GB, không kèm log hành vi).
-
-### Số đo trên máy phát triển
-
-Windows 11, 28 CPU logic, 17 GB RAM; toàn bộ dữ liệu gồm 6.2 GB đầu vào thô, 14.6
-triệu dòng playback, 39,509 profile; cấu hình phục vụ mặc định. Đây không phải cam
-kết năng lực production: chỉ lượt qualification trên máy chủ đích mới là cam kết.
-
-| Bước | Thời gian |
-|---|---:|
-| `make-ready`: hash 81 file, 6.2 GB | 11 s |
-| chuẩn bị dữ liệu canonical và cửa sổ temporal, đầu vào mới | 9–10 phút |
-| fit cả hai scorer và ghi bundle | 35–76 s |
-| gate retrain: ba lượt đánh giá trên 4,201 profile test | ~11 phút |
-| inference, 1 worker, 8 shard | 20.9 phút |
-| inference, 2 worker, 16 shard | 12.4 phút |
-| gộp 39,509 profile và xuất bản | < 1 s |
-
-Hai lượt chạy cùng một batch, một lượt 8 shard trên một worker và một lượt 16
-shard trên hai worker, cho ra file giống hệt từng byte. `qualify-hardware` với hai
-worker đo được chu kỳ 10,000 profile ở tốc độ 51 profile mỗi giây, output giống
-nhau ở cả hai lần lặp, và bộ nhớ đỉnh 9.4 GB tính cả coordinator lẫn hai worker
-(khoảng 4.5 GB mỗi worker ở quy mô dữ liệu này); job báo 2,000,000 profile là
-không đo được và thoát với mã 31, đúng như thiết kế.
-
-Ước tính số học, không phải số đo: với khoảng 31 profile mỗi giây cho mỗi worker,
-2 triệu profile cần khoảng 18 giờ-worker, nên việc đạt mục tiêu 6 giờ phụ thuộc
-vào số worker mà bộ nhớ máy chủ production chứa được.
 
 ## 10. Checklist staging và go-live
 

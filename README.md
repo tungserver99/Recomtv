@@ -59,22 +59,6 @@ Ba file sẽ xuất hiện trong `/tmp/recsys/delivery/generations/`, và
 `/tmp/recsys/delivery/CURRENT.json` trỏ tới chúng. Môi trường production dùng
 đúng hai lệnh này với cấu hình trong `configs/batch.example.json`.
 
-## Chất lượng
-
-Đo offline trên toàn bộ dữ liệu (39,509 profile), chấm từng trang theo những gì
-profile thực sự xem trong 10 ngày tiếp theo (giai đoạn test):
-
-| | |
-|---|---:|
-| nội dung mới mà profile xem sau đó có nằm trong 1,000 candidate của profile | 82% |
-| … có nằm trên trang của profile | 77% |
-| chất lượng thứ tự hàng (`rule_ndcg@20`, 1.0 là hoàn hảo) | 0.71 |
-| số hàng mỗi trang / nội dung mỗi hàng / nội dung lặp giữa các hàng | 20 / 10–30 / ~0 |
-| một lượt inference đầy đủ trên máy desktop 17 GB, 2 worker | 12 phút |
-
-Đây là số đo offline, không phải mức tăng tỷ lệ click hay thời lượng xem: các chỉ
-số đó cần A/B test sau khi hệ thống chạy thật. Chi tiết nằm trong `METRICS.md`.
-
 ## Đọc tiếp
 
 | Nếu cần… | Đọc |
@@ -84,7 +68,7 @@ số đó cần A/B test sau khi hệ thống chạy thật. Chi tiết nằm tr
 | tích hợp tại VNPT theo từng bước | [`TODO.md`](TODO.md) |
 | hiểu cách hệ thống hoạt động bên trong | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
 | tra đặc tả chi tiết từng phần: dữ liệu, label, retrieval, scorer, dựng trang | [`SPEC.md`](SPEC.md) |
-| xem các chỉ số và kết quả của mọi thử nghiệm | [`METRICS.md`](METRICS.md) |
+| tra định nghĩa chỉ số và lệnh đánh giá | [`METRICS.md`](METRICS.md) |
 | chạy test GPU trên Kaggle | [`docs/KAGGLE_TESTING.md`](docs/KAGGLE_TESTING.md) |
 
 ## Cấu trúc repository
@@ -97,7 +81,6 @@ tests/         bộ test (python -m pytest -q)
 all/ clip/ movie/ music/   entry point theo từng domain; rule_process.py được đóng băng
 experiments/   các nghiên cứu và bộ chạy test trên Kaggle
 kaggle/        script bootstrap cho Kaggle
-reports/       báo cáo chỉ số mới nhất, sinh tự động
 rs_output/     file output mẫu theo định dạng của client
 ```
 
