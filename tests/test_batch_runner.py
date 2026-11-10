@@ -80,6 +80,26 @@ def test_inference_never_fits_a_missing_model(tmp_path):
     assert read_current_delivery(config.delivery_root) is None
 
 
+def test_gxep_retrain_requires_an_fcn_artifact_or_refresh_flag(tmp_path):
+    config = _config(tmp_path, scoring_preset="GxEp", fcn_device="cpu")
+    with pytest.raises(BatchError, match="FCN is active"):
+        runner._fcn_artifacts_for_retrain(config)
+
+
+def test_promoted_bundle_rejects_a_different_scoring_preset(tmp_path, monkeypatch):
+    config = _config(tmp_path, scoring_preset="GxEp", fcn_device="cpu")
+    bundle = tmp_path / "promoted"
+    bundle.mkdir()
+    monkeypatch.setattr(runner, "promoted_bundle", lambda registry: bundle)
+    monkeypatch.setattr(
+        runner,
+        "load_bundle",
+        lambda path: (None, None, {"bundle_id": "old", "model_sha256": "hash", "scoring_config": {"preset": "GxGp"}}),
+    )
+    with pytest.raises(BatchError, match="does not match the active config"):
+        runner._promoted(config)
+
+
 def test_shard_and_worker_counts_do_not_change_delivered_bytes(tmp_path):
     write_smoke_batch(tmp_path / "incoming", "b1")
     one = _hand_built(tmp_path / "one", num_shards=1)

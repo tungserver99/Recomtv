@@ -166,9 +166,11 @@ def make_head(
 
 
 def serve_on(model: Any, device: str) -> Any:
-    """Score a fitted scorer's XGBoost heads on ``device`` (sklearn heads are CPU)."""
+    """Score fitted XGBoost heads on ``device``; explicit CUDA is strict."""
     if device not in GBDT_DEVICES:
         raise ValueError(f"unsupported gbdt device: {device}")
+    if device == "cuda":
+        resolve_device(device, strict=True)
     for head in getattr(model, "heads", {}).values():
         if isinstance(head, XGBoostHead):
             head.device = device

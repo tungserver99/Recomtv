@@ -151,6 +151,20 @@ def test_evaluate_baseline_forwards_the_page_flags_it_accepts(monkeypatch):
     assert captured.get("page_content_budget") == 600
 
 
+def test_gxgp_preset_forwards_profile_composition_and_xgboost_defaults(monkeypatch):
+    captured = _forwarded(
+        monkeypatch,
+        "evaluate_popularity_baseline",
+        ["evaluate-baseline", "--scoring-preset", "GxGp"],
+    )
+    scoring = captured["scoring_config"]
+    assert scoring.preset == "GxGp"
+    assert scoring.content_backends == ("heuristic", "gbdt")
+    assert scoring.rank_scope == "profile"
+    assert captured["rule_gbdt_backend"] == "xgboost"
+    assert captured["content_gbdt_backend"] == "xgboost"
+
+
 # Operational flags: they steer where a run writes or whether it runs at all,
 # not what it produces, so the manifest does not need them.
 _NON_CONFIG_LIVE_TEST_FLAGS = {

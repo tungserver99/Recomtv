@@ -53,16 +53,19 @@ from recsys_vnpt.export import (
     serialize_assembled_output,
 )
 from recsys_vnpt.gbdt import serve_on
+from recsys_vnpt.fcn_scorer import load_fcn_scorer
 from recsys_vnpt.output_validation import validate_client_output
-from recsys_vnpt.paths import data_artifact_path
+from recsys_vnpt.paths import data_artifact_path, model_artifact_path
 from recsys_vnpt.runtime import atomic_write_text
 from recsys_vnpt.scorer_bundle import (
     BundleError,
+    bundle_fcn_artifact_paths,
     load_bundle,
     promote,
     promoted_bundle,
     save_bundle,
 )
+from recsys_vnpt.scoring_config import resolve_scoring_config, scoring_config_payload
 from recsys_vnpt.source_manifest import sha256_file, stable_hash
 
 
@@ -230,7 +233,53 @@ def _promoted(config: BatchConfig) -> tuple[Path | None, dict[str, Any]]:
         _, _, manifest = load_bundle(bundle)
     except (BundleError, OSError) as error:
         raise BatchError("MODEL_UNAVAILABLE", str(error)) from error
-    return bundle, {"bundle_id": manifest["bundle_id"], "model_sha256": manifest["model_sha256"]}
+    expected = scoring_config_payload(config.resolved_scoring)
+    stored = manifest.get("scoring_config")
+    if stored is None:
+        if config.resolved_scoring.preset != "legacy":
+            raise BatchError(
+                "MODEL_UNAVAILABLE",
+                "promoted bundle has no scoring-combination metadata; retrain before "
+                "serving a non-legacy preset",
+            )
+    elif stored != expected:
+        raise BatchError(
+            "MODEL_UNAVAILABLE",
+            "promoted bundle scoring combination does not match the active config; "
+            "run run-retrain for this combination",
+        )
+    expected_components = {
+        "rule_ordering": config.rule_ordering,
+        "content_ordering": config.content_ordering,
+        "rule_gbdt_backend": config.resolved_rule_gbdt_backend,
+        "content_gbdt_backend": config.resolved_content_gbdt_backend,
+    }
+    for key, value in expected_components.items():
+        stored_value = manifest.get(key)
+        if stored_value is not None and stored_value != value:
+            raise BatchError(
+                "MODEL_UNAVAILABLE",
+                f"promoted bundle {key}={stored_value!r} does not match active "
+                f"config {value!r}; run run-retrain for this combination",
+            )
+        if (
+            stored_value is None
+            and config.resolved_scoring.preset != "legacy"
+            and key.endswith("gbdt_backend")
+            and (key.startswith("content") or config.rule_ordering == "learned_rrf")
+        ):
+            raise BatchError(
+                "MODEL_UNAVAILABLE",
+                f"promoted bundle has no {key} metadata; retrain before serving a non-legacy preset",
+            )
+    if config.resolved_scoring.uses_fcn and bundle_fcn_artifact_paths(bundle, manifest) is None:
+        raise BatchError(
+            "MODEL_UNAVAILABLE", "promoted bundle is missing the active FCN artifacts"
+        )
+    return bundle, {
+        "bundle_id": manifest["bundle_id"],
+        "model_sha256": manifest.get("bundle_sha256", manifest["model_sha256"]),
+    }
 
 
 # --- shards ----------------------------------------------------------------------
@@ -271,17 +320,27 @@ def _serving_context(config: BatchConfig, bundle: str | None):
         ),
         config.assembly,
     )
-    rule_model = content_model = None
+    rule_model = content_model = fcn_model = None
     if bundle is not None:
-        rule_model, content_model, _ = load_bundle(bundle)
-        serve_on(rule_model, config.gbdt_device)
-        serve_on(content_model, config.gbdt_device)
+        rule_model, content_model, manifest = load_bundle(bundle)
+        if rule_model is not None:
+            serve_on(rule_model, config.gbdt_device)
+        if content_model is not None:
+            serve_on(content_model, config.gbdt_device)
+        artifact_paths = bundle_fcn_artifact_paths(bundle, manifest)
+        if config.resolved_scoring.uses_fcn:
+            if artifact_paths is None:
+                raise BatchError("MODEL_UNAVAILABLE", "active FCN artifacts are missing")
+            fcn_model = load_fcn_scorer(*artifact_paths, device=config.fcn_device)
     context = with_scorers(
         context,
         rule_model if config.rule_ordering == "learned_rrf" else None,
-        content_model if config.content_ordering == "learned_rrf" else None,
+        content_model if config.resolved_scoring.uses_gbdt else None,
         config.rule_scorer_fusion_weight,
         config.content_scorer_fusion_weight,
+        scoring_config=config.resolved_scoring,
+        fcn_scorer=fcn_model,
+        fcn_batch_size=config.fcn_batch_size,
     )
     return context, _member_id_map(context.profiles)
 
@@ -730,7 +789,14 @@ def _set_environment(values: dict[str, str]) -> None:
     os.environ.update(values)
 
 
-def _evaluate(config: BatchConfig, rule_model=None, content_model=None) -> dict[str, Any]:
+def _evaluate(
+    config: BatchConfig,
+    rule_model=None,
+    content_model=None,
+    scoring_config=None,
+    fcn_artifacts: tuple[str, str] | None = None,
+    rule_ordering: str | None = None,
+) -> dict[str, Any]:
     """Test-window quality of one ordering, in a process of its own.
 
     By the time the gate runs, the retrain process carries the heap of fitting
@@ -749,14 +815,45 @@ def _evaluate(config: BatchConfig, rule_model=None, content_model=None) -> dict[
         initializer=_set_environment,
         initargs=(roots,),
     ) as pool:
-        return pool.submit(_evaluate_here, config, rule_model, content_model).result()
+        return pool.submit(
+            _evaluate_here,
+            config,
+            rule_model,
+            content_model,
+            scoring_config,
+            fcn_artifacts,
+            rule_ordering,
+        ).result()
 
 
-def _evaluate_here(config: BatchConfig, rule_model=None, content_model=None) -> dict[str, Any]:
+def _evaluate_here(
+    config: BatchConfig,
+    rule_model=None,
+    content_model=None,
+    scoring_config=None,
+    fcn_artifacts: tuple[str, str] | None = None,
+    rule_ordering: str | None = None,
+) -> dict[str, Any]:
     """Scored exactly like evaluate-baseline, on the gate's profile sample."""
     from recsys_vnpt.evaluation_runs import evaluate_popularity_baseline
 
-    learned = rule_model is not None
+    candidate_active = (
+        scoring_config is not None or rule_model is not None or content_model is not None
+    )
+    active_rule_ordering = rule_ordering or (
+        config.rule_ordering if candidate_active else "count"
+    )
+    active_content_ordering = (
+        config.content_ordering if candidate_active else "hand_sum"
+    )
+    fcn_model = None
+    if scoring_config is not None and scoring_config.uses_fcn:
+        if fcn_artifacts is None:
+            raise BatchError("MODEL_UNAVAILABLE", "active GxEp evaluation has no FCN artifacts")
+        fcn_model = load_fcn_scorer(
+            *fcn_artifacts,
+            device=config.fcn_device,
+        )
     bundle = evaluate_popularity_baseline(
         PROJECT_ROOT,
         config.domain,
@@ -769,15 +866,21 @@ def _evaluate_here(config: BatchConfig, rule_model=None, content_model=None) -> 
         candidate_rules=config.candidate_rules,
         reserved_per_rule=config.reserved_per_rule,
         source_candidates_per_rule=config.source_candidates_per_rule,
-        rule_ordering="learned_rrf" if learned else "count",
+        rule_ordering=active_rule_ordering,
         rule_scorer_fusion_weight=config.rule_scorer_fusion_weight,
-        content_ordering="learned_rrf" if learned else "hand_sum",
+        content_ordering=active_content_ordering,
         content_scorer_fusion_weight=config.content_scorer_fusion_weight,
         contents_per_rule_max=config.contents_per_rule_max,
         page_content_budget=config.page_content_budget,
         page_dedup=config.page_dedup,
         rule_scorer_model=rule_model,
         content_scorer_model=content_model,
+        scoring_config=scoring_config,
+        fcn_scorer_model=fcn_model,
+        rule_gbdt_backend=config.resolved_rule_gbdt_backend,
+        content_gbdt_backend=config.resolved_content_gbdt_backend,
+        gbdt_device=config.gbdt_device,
+        fcn_batch_size=config.fcn_batch_size,
     )
     return {
         "run_id": bundle.manifest.run_id,
@@ -785,6 +888,41 @@ def _evaluate_here(config: BatchConfig, rule_model=None, content_model=None) -> 
         "novel_positive_pairs": int(bundle.evaluation.get("novel_positive_pairs", 0)),
         **{name: float(bundle.evaluation[name]) for name in GATE_METRICS},
     }
+
+
+def _fcn_artifacts_for_retrain(config: BatchConfig) -> tuple[Path, Path] | None:
+    """Reuse an explicit checkpoint or refresh it through the existing train flow."""
+    if not config.resolved_scoring.uses_fcn:
+        return None
+    if config.fcn_refresh:
+        from recsys_vnpt.pipeline_v2 import train_temporal_model
+
+        train_temporal_model(
+            PROJECT_ROOT,
+            config.domain,
+            "fcn_official",
+            resume=False,
+            epochs=100,
+            batch_size=config.fcn_batch_size,
+            require_cuda=config.fcn_device == "cuda",
+        )
+        output = model_artifact_path(
+            config.domain, "v2", "fcn_official", project_root=PROJECT_ROOT
+        )
+        checkpoint, contract = output / "best_model_v2.pth", output / "feature_contract_v2.json"
+    elif config.fcn_checkpoint_path and config.fcn_contract_path:
+        checkpoint, contract = Path(config.fcn_checkpoint_path), Path(config.fcn_contract_path)
+    else:
+        raise BatchError(
+            "RETRAIN_FAILED",
+            "FCN is active; configure a compatible checkpoint/contract or set fcn_refresh=true",
+        )
+    if not checkpoint.is_file() or not contract.is_file():
+        raise BatchError(
+            "RETRAIN_FAILED",
+            f"FCN checkpoint or FeatureContract is missing: {checkpoint}, {contract}",
+        )
+    return checkpoint, contract
 
 
 def retrain_gate(
@@ -857,13 +995,28 @@ def run_retrain_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
                 errors="coerce",
             ).max()
             try:
-                rule_model = train_rule_scorer(
-                    canonical, loader, backend=config.gbdt_backend, device=config.gbdt_device
+                rule_model = (
+                    train_rule_scorer(
+                        canonical,
+                        loader,
+                        backend=config.resolved_rule_gbdt_backend,
+                        device=config.gbdt_device,
+                    )
+                    if config.rule_ordering == "learned_rrf"
+                    else None
                 )
-                content_model = train_content_scorer(
-                    canonical, pd.Timestamp(cutoff), loader,
-                    backend=config.gbdt_backend, device=config.gbdt_device,
+                content_model = (
+                    train_content_scorer(
+                        canonical,
+                        pd.Timestamp(cutoff),
+                        loader,
+                        backend=config.resolved_content_gbdt_backend,
+                        device=config.gbdt_device,
+                    )
+                    if config.resolved_scoring.uses_gbdt
+                    else None
                 )
+                fcn_artifacts = _fcn_artifacts_for_retrain(config)
             except Exception as error:
                 raise BatchError("RETRAIN_FAILED", f"{type(error).__name__}: {error}") from error
             bundle = save_bundle(
@@ -876,17 +1029,68 @@ def run_retrain_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
                     "data_cutoff": manifest.data_cutoff.isoformat(),
                     "serving_cutoff": str(cutoff),
                     "code_version": code_version(),
+                    "scoring_config": scoring_config_payload(config.resolved_scoring),
+                    "rule_ordering": config.rule_ordering,
+                    "content_ordering": config.content_ordering,
+                    "rule_gbdt_backend": config.resolved_rule_gbdt_backend,
+                    "content_gbdt_backend": config.resolved_content_gbdt_backend,
+                    "gbdt_device": config.gbdt_device,
+                    "fcn_device": config.fcn_device,
                 },
+                fcn_checkpoint_path=fcn_artifacts[0] if fcn_artifacts else None,
+                fcn_contract_path=fcn_artifacts[1] if fcn_artifacts else None,
             )
             status.transition("EVALUATING", bundle=str(bundle))
             baseline = _evaluate(config)
-            candidate = _evaluate(config, rule_model, content_model)
+            if config.resolved_scoring.preset == "legacy" and fcn_artifacts is None:
+                candidate = _evaluate(config, rule_model, content_model)
+            else:
+                candidate = _evaluate(
+                    config,
+                    rule_model,
+                    content_model,
+                    config.resolved_scoring,
+                    tuple(map(str, fcn_artifacts)) if fcn_artifacts else None,
+                )
             promoted = None
             current = promoted_bundle(config.root("model_registry"))
             if current is not None:
                 try:
-                    previous_rule, previous_content, _ = load_bundle(current)
-                    promoted = _evaluate(config, previous_rule, previous_content)
+                    previous_rule, previous_content, previous_manifest = load_bundle(current)
+                    previous_artifacts = bundle_fcn_artifact_paths(current, previous_manifest)
+                    stored_scoring = previous_manifest.get("scoring_config")
+                    previous_scoring = (
+                        resolve_scoring_config(
+                            preset=stored_scoring.get("preset", "legacy"),
+                            content_backends=stored_scoring.get("content_backends"),
+                            rank_scope=stored_scoring.get("rank_scope"),
+                            weights=stored_scoring.get("weights"),
+                            rrf_constant=stored_scoring.get("rrf_constant", 60.0),
+                        )
+                        if stored_scoring
+                        else resolve_scoring_config(
+                            legacy_content_ordering=previous_manifest.get(
+                                "content_ordering", "learned_rrf"
+                            ),
+                            legacy_fusion_weight=previous_manifest.get(
+                                "content_scorer_fusion_weight", 5.0
+                            ),
+                        )
+                    )
+                    previous_fcn_artifacts = (
+                        tuple(map(str, previous_artifacts)) if previous_artifacts else None
+                    )
+                    previous_rule_ordering = previous_manifest.get(
+                        "rule_ordering", "learned_rrf" if previous_rule is not None else "count"
+                    )
+                    promoted = _evaluate(
+                        config,
+                        previous_rule,
+                        previous_content,
+                        previous_scoring,
+                        previous_fcn_artifacts,
+                        previous_rule_ordering,
+                    )
                 except (BundleError, OSError) as error:
                     status.log("promoted_bundle_unusable", error=str(error))
 

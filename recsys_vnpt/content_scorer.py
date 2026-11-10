@@ -23,6 +23,7 @@ import pandas as pd
 from scipy import sparse
 
 from recsys_vnpt.gbdt import head_device, make_head
+from recsys_vnpt.scoring_config import ScoringConfig, resolve_scoring_config
 from recsys_vnpt.temporal import load_temporal_windows
 
 
@@ -582,18 +583,100 @@ def pair_features(
 
 
 def rank_within_rule(
-    frame: pd.DataFrame, column: str, constant: float = 60.0
+    frame: pd.DataFrame,
+    column: str,
+    constant: float = 60.0,
+    scope: str = "per_rule",
 ) -> np.ndarray:
-    """Reciprocal rank inside each (profile, rule) block.
+    """Reciprocal rank within a rule or across a profile's unique contents.
 
-    Content ordering is a within-rule problem, so the rank that feeds RRF has
-    to be taken inside the rule -- ranking across the whole profile would let a
-    strong rule's tail outrank a weak rule's head.
+    The legacy default remains per-rule. Profile scope deduplicates contents
+    that were retrieved through multiple rules before ranking, then broadcasts
+    the same reciprocal rank to each matching row. Content-id tie breaks make
+    this scope independent of dataframe, chunk, and shard row order.
     """
-    ranks = frame.groupby(
-        ["profile_id", "candidate_rule_id"], sort=False, observed=True
-    )[column].rank(method="first", ascending=False)
-    return (1.0 / (constant + ranks)).to_numpy(dtype=np.float64)
+    if constant <= 0:
+        raise ValueError("RRF constant must be positive")
+    if scope == "per_rule":
+        ranks = frame.groupby(
+            ["profile_id", "candidate_rule_id"], sort=False, observed=True
+        )[column].rank(method="first", ascending=False)
+        return (1.0 / (constant + ranks)).to_numpy(dtype=np.float64)
+    if scope != "profile":
+        raise ValueError(f"unsupported content rank scope: {scope}")
+    required = {"profile_id", "content_id", column}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"profile ranking is missing columns: {missing}")
+    if frame.empty:
+        return np.empty(0, dtype=np.float64)
+
+    unique = frame[["profile_id", "content_id", column]].copy()
+    unique["profile_id"] = unique["profile_id"].astype(str)
+    unique["content_id"] = unique["content_id"].astype(str)
+    unique[column] = pd.to_numeric(unique[column], errors="coerce").fillna(-np.inf)
+    unique = unique.groupby(
+        ["profile_id", "content_id"], as_index=False, sort=False
+    )[column].max()
+    unique = unique.sort_values(
+        ["profile_id", column, "content_id"],
+        ascending=[True, False, True],
+        kind="mergesort",
+    )
+    unique["_rank"] = unique.groupby("profile_id", sort=False).cumcount() + 1
+    lookup = unique.set_index(["profile_id", "content_id"])["_rank"]
+    keys = pd.MultiIndex.from_arrays(
+        [frame["profile_id"].astype(str), frame["content_id"].astype(str)]
+    )
+    ranks = lookup.reindex(keys).to_numpy(dtype=np.float64)
+    return 1.0 / (constant + ranks)
+
+
+def fuse_content_scores(
+    scored: pd.DataFrame, config: ScoringConfig
+) -> np.ndarray:
+    """Apply the shared rank-fusion formula to already-scored candidates."""
+    if "rule_score" not in scored:
+        raise ValueError("content fusion requires rule_score")
+    output = pd.to_numeric(scored["rule_score"], errors="coerce").fillna(0.0).to_numpy(
+        dtype=np.float64
+    )
+    if "heuristic" in config.content_backends:
+        if "_personalized" not in scored:
+            raise ValueError("heuristic fusion requires _personalized scores")
+        output += config.weights["heuristic"] * rank_within_rule(
+            scored, "_personalized", config.rrf_constant, config.rank_scope
+        )
+    if "gbdt" in config.content_backends:
+        required = {"_predicted_completion_gain", "_predicted_watch_time_gain"}
+        missing = sorted(required - set(scored.columns))
+        if missing:
+            raise ValueError(f"GBDT fusion is missing predictions: {missing}")
+        learned = rank_within_rule(
+            scored,
+            "_predicted_completion_gain",
+            config.rrf_constant,
+            config.rank_scope,
+        ) + rank_within_rule(
+            scored,
+            "_predicted_watch_time_gain",
+            config.rrf_constant,
+            config.rank_scope,
+        )
+        scored = scored.assign(_combined_gbdt_rank=learned)
+        output += config.weights["gbdt"] * rank_within_rule(
+            scored,
+            "_combined_gbdt_rank",
+            config.rrf_constant,
+            config.rank_scope,
+        )
+    if "fcn" in config.content_backends:
+        if "_fcn_score" not in scored:
+            raise ValueError("FCN fusion requires _fcn_score predictions")
+        output += config.weights["fcn"] * rank_within_rule(
+            scored, "_fcn_score", config.rrf_constant, config.rank_scope
+        )
+    return output
 
 
 def _window_positives(path: Path) -> pd.DataFrame:
@@ -880,67 +963,84 @@ def content_serving_scope(
 
 
 def apply_content_scorer(
-    model: ContentScorerModel,
-    serving: ContentServingScope,
+    model: ContentScorerModel | None,
+    serving: ContentServingScope | None,
     candidate_pairs: pd.DataFrame,
     fusion_weight: float = 5.0,
     chunk_size: int = 250_000,
+    scoring_config: ScoringConfig | None = None,
+    fcn_scores: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Re-rank candidates inside each (profile, rule) block by RRF fusion."""
+    """Score enabled components and apply their shared RRF composition."""
     if fusion_weight <= 0:
         raise ValueError("content scorer fusion weight must be positive")
+    config = scoring_config or resolve_scoring_config(
+        legacy_fusion_weight=fusion_weight
+    )
     required = {"profile_id", "content_id", "candidate_rule_id", "retrieval_score", "rule_score"}
     missing = sorted(required - set(candidate_pairs.columns))
     if missing:
         raise ValueError(f"content scorer candidates are missing columns: {missing}")
-    serving_scope = serving.scope
+    if "gbdt" in config.content_backends and (model is None or serving is None):
+        raise ValueError("GBDT content scorer is enabled but its model is missing")
+    if "fcn" in config.content_backends:
+        if fcn_scores is None:
+            raise ValueError("FCN content scorer is enabled but its scores are missing")
+        if len(fcn_scores) != len(candidate_pairs):
+            raise ValueError("FCN score count does not match the candidate rows")
     scored = candidate_pairs.copy()
     scored["profile_id"] = scored["profile_id"].astype(str)
     scored["content_id"] = scored["content_id"].astype(str)
-    in_scope = scored["content_id"].isin(serving_scope.index).to_numpy()
-    # A rule block is re-ranked only when every one of its contents can be
-    # featurised; mixing a learned rank with an unscored fallback inside one
-    # block would put two different scales on the same ladder.
-    block_covered = (
-        pd.Series(in_scope, index=scored.index)
-        .groupby([scored["profile_id"], scored["candidate_rule_id"]])
-        .transform("all")
-        .to_numpy()
-    )
-    target_rows = scored[block_covered]
-    predictions = {gain: np.zeros(len(scored)) for gain in GAIN_COLUMNS}
-    if len(target_rows):
-        context = build_history_context(
-            target_rows["profile_id"], serving.interactions, serving.cutoff, serving_scope
+    if "gbdt" in config.content_backends:
+        assert serving is not None and model is not None
+        serving_scope = serving.scope
+        in_scope = scored["content_id"].isin(serving_scope.index).to_numpy()
+        group_keys = (
+            [scored["profile_id"]]
+            if config.rank_scope == "profile"
+            else [scored["profile_id"], scored["candidate_rule_id"]]
         )
-        positions = np.flatnonzero(block_covered)
-        for start in range(0, len(target_rows), chunk_size):
-            chunk = target_rows.iloc[start : start + chunk_size]
-            features = gather_pair_features(
-                chunk,
-                context,
+        # Do not combine learned and fallback ranks on one ladder. Profile RRF
+        # falls back for the complete profile; legacy RRF keeps rule-level scope.
+        block_covered = pd.Series(in_scope, index=scored.index).groupby(
+            group_keys, sort=False
+        ).transform("all").to_numpy()
+        target_rows = scored[block_covered]
+        predictions = {gain: np.zeros(len(scored)) for gain in GAIN_COLUMNS}
+        if len(target_rows):
+            context = build_history_context(
+                target_rows["profile_id"],
+                serving.interactions,
+                serving.cutoff,
                 serving_scope,
-                serving.popularity_all,
-                serving.popularity_recent,
-            ).to_numpy(dtype=np.float32)
-            for gain, head in model.heads.items():
-                predictions[gain][positions[start : start + len(chunk)]] = head.predict(
-                    features
-                )
+            )
+            positions = np.flatnonzero(block_covered)
+            for start in range(0, len(target_rows), chunk_size):
+                chunk = target_rows.iloc[start : start + chunk_size]
+                features = gather_pair_features(
+                    chunk,
+                    context,
+                    serving_scope,
+                    serving.popularity_all,
+                    serving.popularity_recent,
+                ).to_numpy(dtype=np.float32)
+                for gain, head in model.heads.items():
+                    predictions[gain][positions[start : start + len(chunk)]] = head.predict(
+                        features
+                    )
+        for gain in GAIN_COLUMNS:
+            scored[f"_predicted_{gain}"] = predictions[gain]
+    else:
+        in_scope = np.ones(len(scored), dtype=bool)
+        block_covered = np.ones(len(scored), dtype=bool)
 
-    scored["_personalized"] = scored["retrieval_score"].astype(float) - scored[
-        "rule_score"
-    ].astype(float)
-    for gain in GAIN_COLUMNS:
-        scored[f"_predicted_{gain}"] = predictions[gain]
-    scored["_learned"] = rank_within_rule(
-        scored, "_predicted_completion_gain"
-    ) + rank_within_rule(scored, "_predicted_watch_time_gain")
-    fused = (
-        scored["rule_score"].astype(float).to_numpy()
-        + rank_within_rule(scored, "_personalized")
-        + fusion_weight * rank_within_rule(scored, "_learned")
-    )
+    if "heuristic" in config.content_backends:
+        scored["_personalized"] = scored["retrieval_score"].astype(float) - scored[
+            "rule_score"
+        ].astype(float)
+    if fcn_scores is not None:
+        scored["_fcn_score"] = np.asarray(fcn_scores, dtype=np.float64)
+    fused = fuse_content_scores(scored, config)
     scored["retrieval_score"] = np.where(
         block_covered, fused, scored["retrieval_score"].astype(float)
     )
@@ -951,12 +1051,17 @@ def apply_content_scorer(
             if column.startswith("_personalized")
             or column.startswith("_predicted_")
             or column == "_learned"
+            or column == "_fcn_score"
         ]
     )
     metrics = {
         "content_ordering": "learned_rrf",
         "content_scorer_fusion_weight": float(fusion_weight),
-        **model.metrics,
+        "content_rank_scope": config.rank_scope,
+        "content_backends": list(config.content_backends),
+        "content_fusion_weights": dict(config.weights),
+        "content_fcn_pairs_scored": int(len(scored)) if "fcn" in config.content_backends else 0,
+        **(model.metrics if model is not None else {}),
         "content_scorer_pairs_scored": int(block_covered.sum()),
         "content_scorer_pairs_out_of_scope_rate": float(1.0 - in_scope.mean())
         if len(scored)
@@ -964,7 +1069,7 @@ def apply_content_scorer(
         "content_scorer_blocks_skipped_rate": float(1.0 - block_covered.mean())
         if len(scored)
         else 0.0,
-        **serving.metrics,
+        **(serving.metrics if serving is not None else {}),
     }
     return output, metrics
 
@@ -977,6 +1082,8 @@ def learned_content_ordering_scores(
     evaluation_split: str = "test",
     fusion_weight: float = 5.0,
     chunk_size: int = 250_000,
+    scoring_config: ScoringConfig | None = None,
+    fcn_scores: np.ndarray | None = None,
     **fit_parameters: Any,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Fit the content scorer pre-cutoff and RRF-fuse it with the hand sum."""
@@ -1015,7 +1122,13 @@ def learned_content_ordering_scores(
         popularity_recent=popularity_recent,
     )
     output, metrics = apply_content_scorer(
-        model, serving, candidate_pairs, fusion_weight, chunk_size
+        model,
+        serving,
+        candidate_pairs,
+        fusion_weight,
+        chunk_size,
+        scoring_config=scoring_config,
+        fcn_scores=fcn_scores,
     )
     metrics["content_scorer_seconds"] = time.perf_counter() - started
     return output, metrics

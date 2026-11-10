@@ -20,6 +20,7 @@ from recsys_vnpt.pipeline_v2 import (
     prepare_canonical_project,
     train_temporal_model,
 )
+from recsys_vnpt.pipeline_cli import _add_composition_arguments, _composition_options
 
 
 MODEL_FAMILIES = (
@@ -200,6 +201,7 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
         parser.add_argument("--max-eval-profiles", type=int)
         parser.add_argument("--eval-profile-seed", type=int, default=42)
         _add_gbdt_options(parser)
+        _add_composition_arguments(parser)
     elif operation == "infer":
         parser.add_argument("--model-family", choices=("per_rule_popularity", *MODEL_FAMILIES), default="per_rule_popularity")
         parser.add_argument(
@@ -253,11 +255,13 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
         parser.add_argument("--reserved-per-rule", type=int, default=33)
         parser.add_argument("--source-candidates-per-rule", type=int, default=33)
         _add_gbdt_options(parser)
+        _add_composition_arguments(parser)
         _add_raw_options(parser)
     else:
         raise ValueError(f"Unsupported domain operation: {operation}")
 
     args = parser.parse_args(argv)
+    composition = _composition_options(args) if operation in {"evaluate", "infer"} else {}
     root = Path(args.root).resolve()
     if operation in {"train", "infer"}:
         _prepare_if_requested(args, domain, root)
@@ -336,6 +340,7 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
                 rule_scorer_fusion_weight=args.rule_scorer_fusion_weight,
                 content_ordering=args.content_ordering,
                 content_scorer_fusion_weight=args.content_scorer_fusion_weight,
+                **composition,
                 contents_per_rule_max=args.contents_per_rule_max,
                 page_content_budget=args.page_content_budget,
                 page_dedup=args.page_dedup,
@@ -376,6 +381,7 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
                 rule_scorer_fusion_weight=args.rule_scorer_fusion_weight,
                 content_ordering=args.content_ordering,
                 content_scorer_fusion_weight=args.content_scorer_fusion_weight,
+                **composition,
                 contents_per_rule_max=args.contents_per_rule_max,
                 page_content_budget=args.page_content_budget,
                 page_dedup=args.page_dedup,
@@ -416,6 +422,7 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
             source_candidates_per_rule=args.source_candidates_per_rule,
             gbdt_backend=args.gbdt_backend,
             gbdt_device=args.gbdt_device,
+                **composition,
         )
         payload = {
             "run_id": bundle.manifest.run_id,

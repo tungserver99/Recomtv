@@ -21,6 +21,12 @@ from recsys_vnpt.content_scorer import (
     content_serving_scope,
     learned_content_ordering_scores,
 )
+from recsys_vnpt.fcn_scorer import FCNScorerModel, score_fcn_candidates
+from recsys_vnpt.scoring_config import (
+    ScoringConfig,
+    resolve_scoring_config,
+    scoring_config_payload,
+)
 from recsys_vnpt.engagement import (
     GAIN_COLUMNS,
     historical_sequence_features,
@@ -175,6 +181,11 @@ def _serving_candidates_for_evaluation(
     content_scorer_model: ContentScorerModel | None = None,
     gbdt_backend: str = "sklearn",
     gbdt_device: str = "auto",
+    scoring_config: ScoringConfig | None = None,
+    fcn_scorer_model: FCNScorerModel | None = None,
+    rule_gbdt_backend: str | None = None,
+    content_gbdt_backend: str | None = None,
+    fcn_batch_size: int = 4096,
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
@@ -190,6 +201,12 @@ def _serving_candidates_for_evaluation(
     CandidateBlendAudit,
 ]:
     serving_started = time.perf_counter()
+    scoring_config = scoring_config or resolve_scoring_config(
+        legacy_content_ordering=content_ordering,
+        legacy_fusion_weight=content_scorer_fusion_weight,
+    )
+    if scoring_config.uses_fcn and fcn_scorer_model is None:
+        raise ValueError("FCN content backend is enabled but no FCN scorer is loaded")
     catalog_load_started = time.perf_counter()
     canonical = data_artifact_path("canonical", domain, project_root=root)
     contents = pd.read_parquet(canonical / "contents.parquet")
@@ -432,10 +449,54 @@ def _serving_candidates_for_evaluation(
             canonical / "interactions.parquet", content_ids=content_ids, columns=columns
         )
 
-    if content_ordering == "learned_rrf":
-        # Re-ranks inside each rule only; the rule term of retrieval_score is
-        # carried through untouched so rule ordering stays exactly as the rule
-        # scorer left it. A persisted model is applied as is instead of refit.
+    fcn_scores = None
+    feature_frame = None
+    if scoring_config.uses_fcn:
+        pair_features = candidate_pairs.merge(
+            mapping[["profile_id", "username"]].astype({"profile_id": str}),
+            on="profile_id",
+            how="left",
+        )
+        feature_frame = build_pair_features(
+            pair_features, interactions, feature_items, users, cutoff
+        )
+        playback_path = canonical / "playback_events.parquet"
+        if (
+            "historical_content_sequence"
+            in fcn_scorer_model.contract.multivalue_features
+            and playback_path.exists()
+        ):
+            sequence_features = historical_sequence_features(
+                pd.read_parquet(playback_path), cutoff
+            )
+            feature_frame = feature_frame.merge(
+                sequence_features, on="profile_id", how="left"
+            )
+            for column in (
+                "historical_session_count",
+                "historical_playback_count",
+                "historical_sequence_depth",
+            ):
+                if column in feature_frame:
+                    feature_frame[column] = pd.to_numeric(
+                        feature_frame[column], errors="coerce"
+                    ).fillna(0.0)
+        feature_frame["rule_id"] = feature_frame["candidate_rule_id"].astype("string")
+        fcn_scores = np.concatenate(
+            [
+                score_fcn_candidates(
+                    fcn_scorer_model,
+                    feature_frame.iloc[start : start + 50_000],
+                    batch_size=fcn_batch_size,
+                )
+                for start in range(0, len(feature_frame), 50_000)
+            ]
+        ) if len(feature_frame) else np.empty(0, dtype=np.float32)
+
+    if content_ordering == "learned_rrf" or scoring_config.preset != "legacy":
+        # Rank scope comes from scoring_config: legacy is per-rule while GxGp/
+        # GxEp use one content ranking across each profile. The rule_score term
+        # remains the fusion base; a persisted model is applied as is, not refit.
         if content_scorer_model is not None:
             candidate_pairs, content_scorer_metrics = apply_content_scorer(
                 content_scorer_model,
@@ -444,8 +505,10 @@ def _serving_candidates_for_evaluation(
                 ),
                 candidate_pairs,
                 content_scorer_fusion_weight,
+                scoring_config=scoring_config,
+                fcn_scores=fcn_scores,
             )
-        else:
+        elif scoring_config.uses_gbdt:
             candidate_pairs, content_scorer_metrics = learned_content_ordering_scores(
                 canonical,
                 pd.Timestamp(cutoff),
@@ -453,8 +516,19 @@ def _serving_candidates_for_evaluation(
                 interactions_loader=interactions_loader,
                 evaluation_split=evaluation_split,
                 fusion_weight=content_scorer_fusion_weight,
-                backend=gbdt_backend,
+                scoring_config=scoring_config,
+                fcn_scores=fcn_scores,
+                backend=content_gbdt_backend or gbdt_backend,
                 device=gbdt_device,
+            )
+        else:
+            candidate_pairs, content_scorer_metrics = apply_content_scorer(
+                None,
+                None,
+                candidate_pairs,
+                content_scorer_fusion_weight,
+                scoring_config=scoring_config,
+                fcn_scores=fcn_scores,
             )
         retrieval_metrics.update(content_scorer_metrics)
     elif content_ordering != "hand_sum":
@@ -463,7 +537,11 @@ def _serving_candidates_for_evaluation(
         time.perf_counter() - candidate_generation_started
     )
     feature_materialization_started = time.perf_counter()
-    if materialize_model_features:
+    if feature_frame is not None:
+        feature_frame["retrieval_score"] = candidate_pairs[
+            "retrieval_score"
+        ].to_numpy()
+    elif materialize_model_features:
         candidate_pairs = candidate_pairs.merge(
             mapping[["profile_id", "username"]].astype({"profile_id": str}),
             on="profile_id",
@@ -700,7 +778,7 @@ def _serving_candidates_for_evaluation(
                 interactions_loader=interactions_loader,
                 evaluation_split=evaluation_split,
                 fusion_weight=rule_scorer_fusion_weight,
-                backend=gbdt_backend,
+                backend=rule_gbdt_backend or gbdt_backend,
                 device=gbdt_device,
             )
         retrieval_metrics.update(rule_scorer_metrics)
@@ -799,6 +877,10 @@ def scoring_manifest_config(
     source_candidates_per_rule,
     gbdt_backend,
     gbdt_device,
+    scoring_config: ScoringConfig | None = None,
+    rule_gbdt_backend: str | None = None,
+    content_gbdt_backend: str | None = None,
+    fcn_batch_size: int = 4096,
 ) -> dict[str, Any]:
     """The config that decides which page a run was scored on.
 
@@ -807,6 +889,7 @@ def scoring_manifest_config(
     to record nine unrelated fields and drop all of these.
     """
 
+    resolved = scoring_config or resolve_scoring_config()
     return {
         "evaluation_split": evaluation_split,
         "maximum_evaluation_profiles": maximum_evaluation_profiles,
@@ -825,6 +908,10 @@ def scoring_manifest_config(
         "source_candidates_per_rule": source_candidates_per_rule,
         "gbdt_backend": gbdt_backend,
         "gbdt_device": gbdt_device,
+        "scoring_config": scoring_config_payload(resolved),
+        "rule_gbdt_backend": rule_gbdt_backend or gbdt_backend,
+        "content_gbdt_backend": content_gbdt_backend or gbdt_backend,
+        "fcn_batch_size": fcn_batch_size,
     }
 
 
@@ -864,7 +951,20 @@ def evaluate_temporal_model(
     recency_max_age_days: int = 0,
     gbdt_backend: str = "sklearn",
     gbdt_device: str = "auto",
+    scoring_config: ScoringConfig | None = None,
+    rule_gbdt_backend: str | None = None,
+    content_gbdt_backend: str | None = None,
+    fcn_batch_size: int = 4096,
+    rule_scorer_model: RuleScorerModel | None = None,
+    content_scorer_model: ContentScorerModel | None = None,
+    fcn_scorer_model: FCNScorerModel | None = None,
 ) -> MetricBundle:
+    scoring_config = scoring_config or resolve_scoring_config(
+        legacy_content_ordering=content_ordering,
+        legacy_fusion_weight=content_scorer_fusion_weight,
+    )
+    if scoring_config.uses_fcn and not eval_serving_candidates:
+        raise ValueError("FCN content fusion requires serving candidate evaluation")
     root = Path(project_root).resolve()
     model_output = model_artifact_path(domain, "v2", model_family, project_root=root)
     checkpoint_path = model_output / "best_model_v2.pth"
@@ -873,6 +973,18 @@ def evaluate_temporal_model(
         raise FileNotFoundError(
             f"Missing {model_family} checkpoint/contract for {domain}. Run pipeline_cli train first."
         )
+    model, contract, checkpoint = load_v2_checkpoint(checkpoint_path, contract_path)
+    if scoring_config.uses_fcn:
+        if fcn_scorer_model is None and model_family != "fcn_official":
+            raise ValueError("GxEp content fusion requires the fcn_official model family")
+        if fcn_scorer_model is None:
+            fcn_scorer_model = FCNScorerModel(
+                model=model,
+                contract=contract,
+                checkpoint=checkpoint,
+                model_family=model_family,
+                device="auto",
+            )
     temporal = data_artifact_path("canonical", domain, "temporal", project_root=root)
     # Shares the popularity path's selection so both evaluate the same split
     # on the same profiles against that split's own truth.
@@ -926,6 +1038,13 @@ def evaluate_temporal_model(
                 rule_scorer_fusion_weight=rule_scorer_fusion_weight,
                 content_ordering=content_ordering,
                 content_scorer_fusion_weight=content_scorer_fusion_weight,
+                rule_scorer_model=rule_scorer_model,
+                content_scorer_model=content_scorer_model,
+                scoring_config=scoring_config,
+                fcn_scorer_model=fcn_scorer_model,
+                rule_gbdt_backend=rule_gbdt_backend,
+                content_gbdt_backend=content_gbdt_backend,
+                fcn_batch_size=fcn_batch_size,
             )
         )
     else:
@@ -968,7 +1087,6 @@ def evaluate_temporal_model(
     membership = pd.read_parquet(
         data_artifact_path("canonical", domain, "content_rule_membership.parquet", project_root=root)
     )
-    model, contract, checkpoint = load_v2_checkpoint(checkpoint_path, contract_path)
     prepared_candidates = prepare_inference_input(
         contract, candidates, model_family
     )
@@ -1070,6 +1188,10 @@ def evaluate_temporal_model(
                     source_candidates_per_rule=source_candidates_per_rule,
                     gbdt_backend=gbdt_backend,
                     gbdt_device=gbdt_device,
+                    scoring_config=scoring_config,
+                    rule_gbdt_backend=rule_gbdt_backend or gbdt_backend,
+                    content_gbdt_backend=content_gbdt_backend or gbdt_backend,
+                    fcn_batch_size=fcn_batch_size,
                 ),
             },
         )
@@ -1298,6 +1420,11 @@ def evaluate_popularity_baseline(
     content_scorer_model: ContentScorerModel | None = None,
     gbdt_backend: str = "sklearn",
     gbdt_device: str = "auto",
+    scoring_config: ScoringConfig | None = None,
+    fcn_scorer_model: FCNScorerModel | None = None,
+    rule_gbdt_backend: str | None = None,
+    content_gbdt_backend: str | None = None,
+    fcn_batch_size: int = 4096,
 ) -> MetricBundle:
     """Offline evaluation of the popularity path on fixed temporal truth.
 
@@ -1308,6 +1435,15 @@ def evaluate_popularity_baseline(
         baseline_family = "graded_per_rule_popularity"
     if baseline_family not in IMPLICIT_BASELINE_FAMILIES:
         raise ValueError(f"unsupported baseline family: {baseline_family}")
+    scoring_config = scoring_config or resolve_scoring_config(
+        legacy_content_ordering=content_ordering,
+        legacy_fusion_weight=content_scorer_fusion_weight,
+    )
+    if scoring_config.uses_fcn:
+        if fcn_scorer_model is None:
+            raise ValueError("FCN content fusion requires a loaded FCN scorer")
+        if not eval_serving_candidates:
+            raise ValueError("FCN content fusion requires serving candidate evaluation")
     root = Path(project_root).resolve()
     canonical = data_artifact_path("canonical", domain, project_root=root)
     temporal = canonical / "temporal"
@@ -1383,6 +1519,11 @@ def evaluate_popularity_baseline(
                 content_scorer_model=content_scorer_model,
                 gbdt_backend=gbdt_backend,
                 gbdt_device=gbdt_device,
+                scoring_config=scoring_config,
+                fcn_scorer_model=fcn_scorer_model,
+                rule_gbdt_backend=rule_gbdt_backend,
+                content_gbdt_backend=content_gbdt_backend,
+                fcn_batch_size=fcn_batch_size,
             )
         )
     else:
@@ -1562,6 +1703,10 @@ def evaluate_popularity_baseline(
             "page_dedup": page_dedup,
             "gbdt_backend": gbdt_backend,
             "gbdt_device": gbdt_device,
+            "scoring_config": scoring_config_payload(scoring_config),
+            "rule_gbdt_backend": rule_gbdt_backend or gbdt_backend,
+            "content_gbdt_backend": content_gbdt_backend or gbdt_backend,
+            "fcn_batch_size": fcn_batch_size,
             **asdict(baseline_config),
         },
     )
