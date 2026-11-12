@@ -20,6 +20,7 @@ month_mytv_info.parquet
 **/checkpoints/
 **/runs/
 .venv/
+.superpowers/
 
 # Local pytest/runtime caches
 .pytest_cache/
