@@ -25,12 +25,13 @@ Quy ước dùng trong tài liệu:
 3. **Serving context**: nạp một lần cho mỗi process. Cutoff phục vụ là
    `create_date` lớn nhất trong log đã lọc theo catalog.
 4. **Retrieval** (§5): tối đa 1,000 candidate cho mỗi profile.
-5. **Xếp hạng**: rule scorer sắp thứ tự hàng (§6), content scorer sắp thứ tự nội
-   dung trong hàng (§7).
+5. **Xếp hạng**: theo tổ hợp cấu hình (§7.6); mặc định rule scorer sắp thứ tự
+   hàng (§6), content scorer sắp thứ tự nội dung trong hàng (§7).
 6. **Dựng trang** (§8): 20 hàng, 10–30 nội dung mỗi hàng, 600 slot, khử trùng lặp.
 7. **Kiểm tra và ghi file** (§11).
 
-Job retrain chạy bước 1–2, fit hai scorer (§6, §7), đánh giá và gate (§9). Job
+Job retrain chạy bước 1–2, fit hai scorer (§6, §7) và các FCN mà tổ hợp cần
+(§7.6), đánh giá và gate (§9). Job
 inference chạy bước 1 rồi 3–7 với bundle đang được promote, không fit gì.
 
 ## 2. Dữ liệu thô → canonical
@@ -574,19 +575,55 @@ Cố định trong code: như rule scorer (§6.4), với bốn feature categoric
 ### 7.5 Chấm điểm và kết hợp
 
 Khối là tập candidate cùng (profile, `candidate_rule_id`). Một khối chỉ được chấm
-lại khi mọi nội dung trong khối nằm trong phạm vi §7.1; nếu không, khối giữ nguyên
-`retrieval_score`.
+khi mọi nội dung trong khối nằm trong phạm vi §7.1.
 
-Gọi RRk(x) = 1 / (60 + hạng của x trong khối).
+Gọi RR(x) = 1 / (60 + hạng giảm dần của x), hạng tính trong khối khi
+`content_rank_scope` = `rule`, hoặc trên mọi candidate của profile khi = `profile`.
 
 - personalized = `retrieval_score` − `rule_score` (phần heuristic của §5.3);
-- learned = RRk(dự đoán `completion_gain`) + RRk(dự đoán `watch_time_gain`);
-- `retrieval_score` mới = `rule_score` + RRk(personalized) + w × RRk(learned);
+- learned = RR(dự đoán `completion_gain`) + RR(dự đoán `watch_time_gain`), bằng 0
+  ở khối không được chấm;
+- `rule`: `retrieval_score` mới = `rule_score` + RR(personalized) + w × RR(learned);
+  khối không được chấm giữ nguyên `retrieval_score`;
+- `profile`: `retrieval_score` mới = RR(personalized) + w × RR(learned) cho mọi
+  candidate;
 - dự đoán theo chunk 250,000 dòng.
 
 | Tham số | Giá trị |
 |---|---|
 | `content_scorer_fusion_weight` | 5.0 |
+| `content_rank_scope` | profile |
+
+### 7.6 Tổ hợp thứ tự hàng và nội dung
+
+**Code:** `orderings.py` (`OrderingConfig`, `apply_orderings`, `COMBINATIONS`).
+
+Thứ tự hàng và thứ tự nội dung được chọn độc lập. Cả đánh giá, gate và serving đều
+gọi `apply_orderings` với cùng `OrderingConfig`, nên trang được đo chính là trang
+được phục vụ. Key `combination` của batch config, hay `--combination` của CLI, điền
+sẵn các trường theo một tổ hợp đã đo (`README.md`).
+
+| `rule_ordering` | Thứ tự hàng |
+|---|---|
+| `count` | affinity rule của §5.4 |
+| `learned_rrf` | rule scorer §6.5 |
+| `fcn` | head rule của `hierarchical_fcn`, gộp theo `aggregate_model_rule_scores`; rule không có điểm FCN giữ affinity |
+| `segment` | profile có lịch sử VOD giữ affinity; profile còn lại: 0.5 × độ phổ biến toàn cục của rule + 0.5 × trung bình độ phổ biến của rule trong ba nhóm (`package_code`, `province`, nhóm tuổi), chuẩn hóa về 1 trong mỗi profile |
+
+| `content_ordering` | `retrieval_score` mới |
+|---|---|
+| `hand_sum` | giữ nguyên |
+| `learned_rrf` | §7.5 |
+| `fcn` | điểm FCN của `content_fcn_family` |
+| `fcn_rrf` | như §7.5, thay learned bằng điểm FCN |
+| `ensemble` | như §7.5, cộng thêm w × RR(điểm FCN) |
+| `routed` | profile có trong vocabulary `profile_id` của FCN: như `fcn_rrf`; còn lại: `learned_rrf` hoặc `segment` theo `routed_fallback` |
+| `segment` | profile có lịch sử VOD giữ nguyên; còn lại: `rule_score` + 0.5 × độ phổ biến toàn cục + 0.5 × trung bình độ phổ biến trong ba nhóm |
+
+FCN được chấm theo từng chunk 1,000 profile, với feature dựng như luồng đánh giá
+neural (§10). Trong retrain, FCN được train trên train_1..3 và validation trong
+`fcn_epochs` epoch với lịch cosine dài `fcn_schedule_epochs` epoch, và giữ epoch
+cuối.
 
 ## 8. Dựng trang
 
@@ -670,37 +707,41 @@ Các chính sách khác trong `PAGE_DEDUP_POLICIES`, giữ lại để so sánh:
 | File | Nội dung |
 |---|---|
 | `scorers.joblib` | hai model: các head, `rule_index` (rule scorer) hoặc `level_maps` (content scorer), và metrics khi fit |
-| `bundle.json` | `schema_version` 1, `bundle_id` = `<thời điểm UTC>_<12 ký tự đầu SHA-256>`, `model_sha256`, phiên bản `python`/`scikit-learn`/`numpy`/`pandas`, metrics của hai scorer, `batch_id`, `input_fingerprint`, `data_cutoff`, `serving_cutoff`, `code_version` |
+| `fcn/<family>/` | `best_model_v2.pth` và `feature_contract_v2.json` của từng FCN mà tổ hợp cần, nếu có |
+| `bundle.json` | `schema_version` 1, `bundle_id` = `<thời điểm UTC>_<12 ký tự đầu bundle_sha256>`, `model_sha256` (của `scorers.joblib`), `bundle_sha256` (của mọi mô hình), `fcn` (SHA-256 từng file FCN), phiên bản `python`/`scikit-learn`/`numpy`/`pandas`/`xgboost`/`torch`, metrics của hai scorer, `ordering`, `batch_id`, `input_fingerprint`, `data_cutoff`, `serving_cutoff`, `code_version` |
 
-**Nạp bundle**: phải khớp `schema_version`, SHA-256 của `scorers.joblib`, và phiên
-bản scikit-learn đang cài. Sai bất kỳ điều kiện nào đều bị từ chối (trong batch
-là `MODEL_UNAVAILABLE`).
+**Nạp bundle**: phải khớp `schema_version`, SHA-256 của `scorers.joblib` và của
+từng file FCN mà tổ hợp cần, phiên bản scikit-learn đang cài, và phiên bản xgboost
+khi một scorer dùng XGBoost. Thiếu FCN mà tổ hợp cần, hoặc sai bất kỳ điều kiện
+nào, đều bị từ chối (trong batch là `MODEL_UNAVAILABLE`).
 
 **Promote**:
 - nội dung hiện tại của `promoted_model.json` được sao vào `previous_model.json`;
 - sau đó `promoted_model.json` được ghi atomic với `bundle_id`, `bundle_path`,
   `model_sha256`, `promoted_at` và kết quả gate.
 
-**Gate**: ba lượt đánh giá trên cửa sổ `test`, mỗi lượt trong một process riêng,
-cùng cấu hình phục vụ và cùng một mẫu `gate_evaluation_profiles` (5000) profile.
-Mẫu được chọn tất định: trong các profile có positive, sắp theo
-sha256(`seed`|`profile_id`) rồi lấy từ đầu. Ba lượt gồm:
-- thứ tự heuristic (`count` + `hand_sum`);
+**Gate**: hai lượt đánh giá trên cửa sổ `test`, mỗi lượt trong một process riêng,
+cùng cấu hình phục vụ (gồm tổ hợp §7.6) và cùng một mẫu `gate_evaluation_profiles`
+(5000) profile. Mẫu được chọn tất định: trong các profile có positive, sắp theo
+sha256(`seed`|`profile_id`) rồi lấy từ đầu. Hai lượt gồm:
 - bundle mới;
-- bundle đang promote, nếu có.
+- bundle đang promote, nếu có và có đủ mô hình mà tổ hợp cần.
 
 Bundle mới đạt khi thỏa mọi điều kiện sau:
 
 - cửa sổ test có ít nhất một novel positive;
-- với `rule_ndcg@20` và `macro_content_ndcg@10`: không thấp hơn thứ tự heuristic;
-- với cả hai chỉ số đó: không thấp hơn bundle đang promote × (1 −
-  `gate_max_regression`), tức mức giảm tương đối tối đa 2%.
+- với `rule_ndcg@20` và `macro_content_ndcg@10`: không thấp hơn bundle đang
+  promote × (1 − `gate_max_regression`), tức mức giảm tương đối tối đa 2%.
 
-## 10. Luồng neural và embedding (chỉ dùng cho nghiên cứu)
+Điều kiện "không thấp hơn thứ tự heuristic" đã tắt từ 2026-11-10 (để lại dạng
+comment trong `retrain_gate`).
+
+## 10. Luồng neural và embedding
 
 **Code:** `feature_contract.py`, `models.py`, `losses.py`, `model_runner.py`.
 
-Luồng này hiện không được dùng để phục vụ trang (`ARCHITECTURE.md`, mục "Họ mô
+`fcn_official` và `hierarchical_fcn` phục vụ trang khi tổ hợp cấu hình dùng FCN
+(§7.6). Các họ còn lại chỉ dùng cho nghiên cứu (`ARCHITECTURE.md`, mục "Họ mô
 hình").
 
 **`FeatureContract`** được lưu cùng checkpoint và phải được nạp trước khi chấm.

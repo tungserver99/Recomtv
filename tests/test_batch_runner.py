@@ -80,26 +80,6 @@ def test_inference_never_fits_a_missing_model(tmp_path):
     assert read_current_delivery(config.delivery_root) is None
 
 
-def test_gxep_retrain_requires_an_fcn_artifact_or_refresh_flag(tmp_path):
-    config = _config(tmp_path, scoring_preset="GxEp", fcn_device="cpu")
-    with pytest.raises(BatchError, match="FCN is active"):
-        runner._fcn_artifacts_for_retrain(config)
-
-
-def test_promoted_bundle_rejects_a_different_scoring_preset(tmp_path, monkeypatch):
-    config = _config(tmp_path, scoring_preset="GxEp", fcn_device="cpu")
-    bundle = tmp_path / "promoted"
-    bundle.mkdir()
-    monkeypatch.setattr(runner, "promoted_bundle", lambda registry: bundle)
-    monkeypatch.setattr(
-        runner,
-        "load_bundle",
-        lambda path: (None, None, {"bundle_id": "old", "model_sha256": "hash", "scoring_config": {"preset": "GxGp"}}),
-    )
-    with pytest.raises(BatchError, match="does not match the active config"):
-        runner._promoted(config)
-
-
 def test_shard_and_worker_counts_do_not_change_delivered_bytes(tmp_path):
     write_smoke_batch(tmp_path / "incoming", "b1")
     one = _hand_built(tmp_path / "one", num_shards=1)
@@ -135,6 +115,17 @@ def test_a_rerun_recomputes_only_the_shards_that_do_not_verify(tmp_path, monkeyp
     assert report["shards_reused"] == config.num_shards - 1
 
 
+def test_max_profiles_serves_a_stable_sample(tmp_path):
+    write_smoke_batch(tmp_path / "incoming", "b1")
+    config = _hand_built(tmp_path, max_profiles=5)
+    report = runner.run_inference_batch(config, "b1")
+    assert report["status"] == "published"
+    assert report["profiles"] == 5
+    ids = [f"p{i}" for i in range(30)]
+    assert runner.sample_profiles(ids, 5) == runner.sample_profiles(list(reversed(ids)), 5)
+    assert runner.sample_profiles(ids, 0) == ids
+
+
 def test_a_batch_that_does_not_advance_the_cutoff_is_refused(tmp_path):
     write_smoke_batch(tmp_path / "incoming", "b1")
     write_smoke_batch(tmp_path / "incoming", "b1-copy")
@@ -147,29 +138,35 @@ def test_a_batch_that_does_not_advance_the_cutoff_is_refused(tmp_path):
 
 def test_a_failed_gate_leaves_the_promoted_model_alone(tmp_path, monkeypatch):
     write_smoke_batch(tmp_path / "incoming", "b1")
+    write_smoke_batch(tmp_path / "incoming", "b2")
     config = _config(tmp_path)
+    first = runner.run_retrain_batch(config, "b1")
 
-    def worse(config, rule_model=None, content_model=None):
-        score = 0.5 if rule_model is None else 0.4
+    def worse(config, bundle=None):
+        # The bundle being gated scores below the promoted one.
+        score = 0.4 if Path(bundle).resolve() != Path(first["bundle"]).resolve() else 0.5
         return {"run_id": "x", "novel_positive_pairs": 10, "rule_ndcg@20": score, "macro_content_ndcg@10": score}
 
     monkeypatch.setattr(runner, "_evaluate", worse)
     with pytest.raises(BatchError, match="QUALITY_GATE_FAILED") as error:
-        runner.run_retrain_batch(config, "b1")
+        runner.run_retrain_batch(config, "b2")
     assert error.value.exit_code == 22
-    assert promoted_bundle(config.model_registry) is None
-    status = json.loads((Path(config.work_root) / "batches/b1/retrain/status.json").read_text())
+    assert promoted_bundle(config.model_registry) == Path(first["bundle"]).resolve()
+    status = json.loads((Path(config.work_root) / "batches/b2/retrain/status.json").read_text())
     assert status["phase"] == "REJECTED"
 
 
 def test_gate_requires_evidence_and_bounds_regression():
-    baseline = {"novel_positive_pairs": 5, "rule_ndcg@20": 0.60, "macro_content_ndcg@10": 0.10}
     candidate = {"novel_positive_pairs": 5, "rule_ndcg@20": 0.62, "macro_content_ndcg@10": 0.13}
-    assert runner.retrain_gate(baseline, candidate, None, 0.02)["passed"]
+    assert runner.retrain_gate(candidate, None, 0.02)["passed"]
     promoted = {"rule_ndcg@20": 0.70, "macro_content_ndcg@10": 0.13}
-    assert not runner.retrain_gate(baseline, candidate, promoted, 0.02)["passed"]
+    assert not runner.retrain_gate(candidate, promoted, 0.02)["passed"]
     empty = {**candidate, "novel_positive_pairs": 0}
-    assert not runner.retrain_gate(baseline, empty, None, 0.02)["passed"]
+    assert not runner.retrain_gate(empty, None, 0.02)["passed"]
+    # The hand-built ordering is no longer a threshold.
+    assert [check["check"] for check in runner.retrain_gate(candidate, None, 0.02)["checks"]] == [
+        "test window has novel positives"
+    ]
 
 
 def test_merge_rejects_a_profile_in_two_shards(tmp_path):

@@ -9,7 +9,6 @@ and only from the deployment's own model store.
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 import platform
 import shutil
@@ -24,9 +23,10 @@ import pandas as pd
 import sklearn
 
 from recsys_vnpt.content_scorer import ContentScorerModel
+from recsys_vnpt.orderings import FcnModel, load_fcn_models
 from recsys_vnpt.rule_scorer import RuleScorerModel
 from recsys_vnpt.runtime import atomic_write_text
-from recsys_vnpt.source_manifest import sha256_file
+from recsys_vnpt.source_manifest import sha256_file, stable_hash
 
 
 BUNDLE_SCHEMA_VERSION = 1
@@ -34,6 +34,8 @@ MODEL_FILE = "scorers.joblib"
 MANIFEST_FILE = "bundle.json"
 PROMOTED = "promoted_model.json"
 PREVIOUS = "previous_model.json"
+FCN_DIR = "fcn"
+FCN_FILES = ("best_model_v2.pth", "feature_contract_v2.json")
 
 
 class BundleError(RuntimeError):
@@ -62,74 +64,50 @@ def _library_versions() -> dict[str, str]:
 
 def save_bundle(
     models_root: str | Path,
-    rule_model: RuleScorerModel | None,
-    content_model: ContentScorerModel | None,
+    rule_model: RuleScorerModel,
+    content_model: ContentScorerModel,
     metadata: dict[str, Any],
-    *,
-    fcn_checkpoint_path: str | Path | None = None,
-    fcn_contract_path: str | Path | None = None,
+    fcn_dirs: dict[str, str | Path] | None = None,
 ) -> Path:
-    """Write a new immutable bundle under ``models_root`` and return its path."""
+    """Write a new immutable bundle under ``models_root`` and return its path.
+
+    ``fcn_dirs`` maps an FCN family to the directory its training wrote; the
+    checkpoint and contract are copied in and hashed with the GBDT payload."""
     root = Path(models_root)
     root.mkdir(parents=True, exist_ok=True)
-    if (fcn_checkpoint_path is None) != (fcn_contract_path is None):
-        raise BundleError("both FCN checkpoint and contract are required")
-    if fcn_checkpoint_path is not None:
-        for label, source in (
-            ("checkpoint", Path(fcn_checkpoint_path)),
-            ("contract", Path(fcn_contract_path)),
-        ):
-            if not source.is_file():
-                raise BundleError(f"FCN {label} is missing: {source}")
     created = datetime.now(timezone.utc)
     stage = root / f".{uuid.uuid4().hex}.stage"
     stage.mkdir()
     try:
         joblib.dump({"rule": rule_model, "content": content_model}, stage / MODEL_FILE)
         digest = sha256_file(stage / MODEL_FILE)
+        fcn: dict[str, dict[str, str]] = {}
+        for family, source in sorted((fcn_dirs or {}).items()):
+            target = stage / FCN_DIR / family
+            target.mkdir(parents=True)
+            for name in FCN_FILES:
+                shutil.copy2(Path(source) / name, target / name)
+            fcn[family] = {name: sha256_file(target / name) for name in FCN_FILES}
+        identity = stable_hash([digest, fcn]) if fcn else digest
+        bundle_id = f"{created:%Y%m%dT%H%M%SZ}_{identity[:12]}"
+        libraries = _library_versions()
+        if fcn:
+            import torch
+
+            libraries["torch"] = torch.__version__
         manifest = {
             "schema_version": BUNDLE_SCHEMA_VERSION,
+            "bundle_id": bundle_id,
             "created_at": created.isoformat(),
             "model_file": MODEL_FILE,
             "model_sha256": digest,
-            "libraries": _library_versions(),
-            "rule_scorer": rule_model.metrics if rule_model is not None else None,
-            "content_scorer": content_model.metrics if content_model is not None else None,
+            "bundle_sha256": identity,
+            "fcn": fcn,
+            "libraries": libraries,
+            "rule_scorer": rule_model.metrics,
+            "content_scorer": content_model.metrics,
             **metadata,
         }
-        if fcn_checkpoint_path is not None and fcn_contract_path is not None:
-            fcn_dir = stage / "fcn"
-            fcn_dir.mkdir()
-            checkpoint_name = "fcn/best_model_v2.pth"
-            contract_name = "fcn/feature_contract_v2.json"
-            shutil.copyfile(fcn_checkpoint_path, stage / checkpoint_name)
-            shutil.copyfile(fcn_contract_path, stage / contract_name)
-            manifest["fcn_artifacts"] = {
-                "checkpoint_file": checkpoint_name,
-                "checkpoint_sha256": sha256_file(stage / checkpoint_name),
-                "contract_file": contract_name,
-                "contract_sha256": sha256_file(stage / contract_name),
-            }
-            bundle_digest = hashlib.sha256(
-                "\n".join(
-                    (
-                        digest,
-                        manifest["fcn_artifacts"]["checkpoint_sha256"],
-                        manifest["fcn_artifacts"]["contract_sha256"],
-                    )
-                ).encode("ascii")
-            ).hexdigest()
-            manifest["bundle_sha256"] = bundle_digest
-            try:
-                import torch
-            except ImportError as error:
-                raise BundleError("PyTorch is required for an FCN scorer bundle") from error
-            manifest["libraries"]["torch"] = torch.__version__
-        else:
-            # Preserve the schema-1 legacy identity for scorer-only bundles.
-            manifest["bundle_sha256"] = digest
-        bundle_id = f"{created:%Y%m%dT%H%M%SZ}_{manifest['bundle_sha256'][:12]}"
-        manifest["bundle_id"] = bundle_id
         (stage / MANIFEST_FILE).write_text(
             json.dumps(manifest, indent=2, sort_keys=True, default=str),
             encoding="utf-8",
@@ -154,7 +132,7 @@ def read_bundle_manifest(bundle: str | Path) -> dict[str, Any]:
 
 def load_bundle(
     bundle: str | Path,
-) -> tuple[RuleScorerModel | None, ContentScorerModel | None, dict[str, Any]]:
+) -> tuple[RuleScorerModel, ContentScorerModel, dict[str, Any]]:
     """Verify, then load. A pickle from another scikit-learn release is refused
     rather than trusted: tree internals are not stable across versions."""
     manifest = read_bundle_manifest(bundle)
@@ -168,68 +146,39 @@ def load_bundle(
             f"has {sklearn.__version__}; retrain under the serving environment"
         )
     uses_xgboost = "xgboost" in (
-        (manifest.get("rule_scorer") or {}).get("rule_scorer_backend"),
-        (manifest.get("content_scorer") or {}).get("content_scorer_backend"),
+        manifest.get("rule_scorer", {}).get("rule_scorer_backend"),
+        manifest.get("content_scorer", {}).get("content_scorer_backend"),
     )
     if uses_xgboost and manifest["libraries"].get("xgboost") != _xgboost_version():
         raise BundleError(
             f"bundle was trained with xgboost {manifest['libraries'].get('xgboost')}, this environment "
             f"has {_xgboost_version()}; retrain under the serving environment"
         )
-    fcn_artifacts = manifest.get("fcn_artifacts")
-    if fcn_artifacts is not None:
-        try:
-            import torch
-        except ImportError as error:
-            raise BundleError("this FCN bundle requires PyTorch") from error
-        if manifest["libraries"].get("torch") != torch.__version__:
-            raise BundleError(
-                "bundle was trained with PyTorch "
-                f"{manifest['libraries'].get('torch')}, this environment has "
-                f"{torch.__version__}; install a compatible version"
-            )
-        for key, hash_key in (
-            ("checkpoint_file", "checkpoint_sha256"),
-            ("contract_file", "contract_sha256"),
-        ):
-            relative = Path(str(fcn_artifacts.get(key, "")))
-            if relative.is_absolute() or ".." in relative.parts:
-                raise BundleError(f"FCN artifact path is unsafe: {relative}")
-            artifact = Path(bundle) / relative
-            if (
-                not artifact.is_file()
-                or sha256_file(artifact) != fcn_artifacts.get(hash_key)
-            ):
-                raise BundleError(f"FCN artifact is missing or corrupt: {artifact}")
-        expected_bundle_digest = hashlib.sha256(
-            "\n".join(
-                (
-                    manifest["model_sha256"],
-                    fcn_artifacts["checkpoint_sha256"],
-                    fcn_artifacts["contract_sha256"],
-                )
-            ).encode("ascii")
-        ).hexdigest()
-        if manifest.get("bundle_sha256") != expected_bundle_digest:
-            raise BundleError("bundle identity does not match its FCN artifacts")
-    elif manifest.get("bundle_sha256", manifest["model_sha256"]) != manifest["model_sha256"]:
-        raise BundleError("scorer bundle identity does not match its model payload")
     payload = joblib.load(model_path)
-    return payload.get("rule"), payload.get("content"), manifest
+    return payload["rule"], payload["content"], manifest
 
 
-def bundle_fcn_artifact_paths(
-    bundle: str | Path, manifest: dict[str, Any] | None = None
-) -> tuple[Path, Path] | None:
-    """Return verified FCN paths from a loaded bundle, or ``None`` for legacy."""
-    active_manifest = manifest or read_bundle_manifest(bundle)
-    artifacts = active_manifest.get("fcn_artifacts")
-    if artifacts is None:
-        return None
-    return (
-        Path(bundle) / artifacts["checkpoint_file"],
-        Path(bundle) / artifacts["contract_file"],
-    )
+def bundle_identity(manifest: dict[str, Any]) -> str:
+    """Hash of every model in the bundle; older bundles carry only the GBDT one."""
+    return manifest.get("bundle_sha256", manifest["model_sha256"])
+
+
+def load_bundle_fcn(bundle: str | Path, families: tuple[str, ...]) -> dict[str, FcnModel]:
+    """The bundle's FCN models for ``families``, each verified against its hash."""
+    manifest = read_bundle_manifest(bundle)
+    stored = manifest.get("fcn", {})
+    missing = [family for family in families if family not in stored]
+    if missing:
+        raise BundleError(
+            f"bundle {manifest['bundle_id']} has no FCN model for {missing}; "
+            "run run-retrain with this ordering first"
+        )
+    for family in families:
+        for name, digest in stored[family].items():
+            path = Path(bundle) / FCN_DIR / family / name
+            if not path.is_file() or sha256_file(path) != digest:
+                raise BundleError(f"bundle FCN file is missing or corrupt: {path}")
+    return load_fcn_models(Path(bundle) / FCN_DIR, families)
 
 
 def promoted_bundle(registry: str | Path) -> Path | None:

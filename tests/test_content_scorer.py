@@ -218,7 +218,9 @@ def test_rule_head_sampler_requires_popularity():
         )
 
 
-def test_rank_within_rule_restarts_at_every_rule():
+def test_reciprocal_rank_restarts_at_every_rule_or_runs_over_the_profile():
+    from recsys_vnpt.orderings import reciprocal_rank
+
     frame = pd.DataFrame(
         {
             "profile_id": ["p1"] * 4,
@@ -226,89 +228,9 @@ def test_rank_within_rule_restarts_at_every_rule():
             "score": [10.0, 5.0, 3.0, 1.0],
         }
     )
-    ranks = content_scorer.rank_within_rule(frame, "score")
-    # Ranking across the profile would give 1..4; within the rule the third
-    # row is a rule head again and must match the first row's score.
-    assert ranks[0] == pytest.approx(ranks[2])
-    assert ranks[1] == pytest.approx(ranks[3])
-    assert ranks[0] > ranks[1]
-
-
-def test_profile_rank_counts_a_content_once_and_is_stable_under_row_shuffle():
-    frame = pd.DataFrame(
-        {
-            "profile_id": ["p1"] * 4,
-            "candidate_rule_id": ["2", "1", "1", "3"],
-            "content_id": ["c1", "c1", "c2", "c3"],
-            "score": [10.0, 10.0, 10.0, 5.0],
-        }
-    )
-
-    expected = {
-        ("2", "c1"): 1 / 61,
-        ("1", "c1"): 1 / 61,
-        ("1", "c2"): 1 / 62,
-        ("3", "c3"): 1 / 63,
-    }
-    for shuffled in (frame, frame.iloc[[3, 2, 0, 1]].reset_index(drop=True)):
-        ranks = content_scorer.rank_within_rule(
-            shuffled, "score", scope="profile"
-        )
-        actual = dict(
-            zip(
-                zip(shuffled["candidate_rule_id"], shuffled["content_id"]),
-                ranks,
-            )
-        )
-        assert actual == pytest.approx(expected)
-
-
-def test_gxgp_fusion_uses_profile_rank_for_heuristic_and_both_gbdt_heads():
-    from recsys_vnpt.content_scorer import fuse_content_scores
-    from recsys_vnpt.scoring_config import resolve_scoring_config
-
-    frame = pd.DataFrame(
-        {
-            "profile_id": ["p1"] * 3,
-            "candidate_rule_id": ["1", "1", "2"],
-            "content_id": ["a", "b", "c"],
-            "rule_score": [2.0, 2.0, 2.0],
-            "_personalized": [3.0, 2.0, 1.0],
-            "_predicted_completion_gain": [3.0, 2.0, 1.0],
-            "_predicted_watch_time_gain": [3.0, 2.0, 1.0],
-        }
-    )
-    config = resolve_scoring_config(preset="GxGp")
-
-    scores = fuse_content_scores(frame, config)
-
-    expected = [
-        2.0 + 1 / 61 + 5 / 61,
-        2.0 + 1 / 62 + 5 / 62,
-        2.0 + 1 / 63 + 5 / 63,
-    ]
-    assert scores == pytest.approx(expected)
-
-
-def test_gxep_fusion_requires_and_uses_the_fcn_rank():
-    from recsys_vnpt.content_scorer import fuse_content_scores
-    from recsys_vnpt.scoring_config import resolve_scoring_config
-
-    frame = pd.DataFrame(
-        {
-            "profile_id": ["p1", "p1"],
-            "candidate_rule_id": ["1", "2"],
-            "content_id": ["a", "b"],
-            "rule_score": [0.0, 0.0],
-            "_personalized": [1.0, 2.0],
-            "_predicted_completion_gain": [1.0, 2.0],
-            "_predicted_watch_time_gain": [1.0, 2.0],
-        }
-    )
-    config = resolve_scoring_config(preset="GxEp")
-    with pytest.raises(ValueError, match="FCN fusion requires"):
-        fuse_content_scores(frame, config)
-
-    frame["_fcn_score"] = [0.0, 1.0]
-    scores = fuse_content_scores(frame, config)
-    assert scores[0] < scores[1]
+    within_rule = reciprocal_rank(frame, frame["score"], "rule")
+    # Inside the rule the third row is a rule head again.
+    assert within_rule[0] == pytest.approx(within_rule[2])
+    assert within_rule[1] == pytest.approx(within_rule[3])
+    over_profile = reciprocal_rank(frame, frame["score"], "profile")
+    assert over_profile == pytest.approx(1.0 / (60.0 + np.arange(1, 5)))

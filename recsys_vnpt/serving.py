@@ -22,18 +22,10 @@ import numpy as np
 import pandas as pd
 import time
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from recsys_vnpt.bootstrap import ensure_checkpoint
-from recsys_vnpt.content_scorer import (
-    ContentScorerModel,
-    ContentServingScope,
-    apply_content_scorer,
-    content_serving_scope,
-    train_content_scorer,
-)
-from recsys_vnpt.fcn_scorer import FCNScorerModel, score_fcn_candidates
-from recsys_vnpt.scoring_config import ScoringConfig, resolve_scoring_config, scoring_config_payload
+from recsys_vnpt.content_scorer import ContentScorerModel, train_content_scorer
 from recsys_vnpt.evaluation import evaluate_scored_candidates
 from recsys_vnpt.evaluation_runs import _serving_candidates_for_evaluation
 from recsys_vnpt.export import (
@@ -53,6 +45,14 @@ from recsys_vnpt.model_runner import (
     load_v2_checkpoint,
     predict,
     prepare_inference_input,
+)
+from recsys_vnpt.orderings import (
+    FcnModel,
+    OrderingConfig,
+    OrderingParts,
+    apply_orderings,
+    load_fcn_models,
+    ordering_parts,
 )
 from recsys_vnpt.output_validation import validate_client_output
 from recsys_vnpt.paths import (
@@ -76,16 +76,9 @@ from recsys_vnpt.rule_assembly import (
     bayesian_rule_popularity,
     explode_content_rule_membership,
 )
-from recsys_vnpt.rule_scorer import (
-    RuleScorerModel,
-    RuleServingScope,
-    apply_rule_scorer,
-    rule_serving_scope,
-    train_rule_scorer,
-)
+from recsys_vnpt.rule_scorer import RuleScorerModel, train_rule_scorer
 from recsys_vnpt.runtime import _rss_bytes
 from recsys_vnpt.temporal import (
-    build_pair_features,
     historical_profile_features,
     load_temporal_windows,
 )
@@ -171,15 +164,8 @@ class ServingContext:
     content_types: pd.DataFrame
     catalog: dict[str, dict[str, Any]]
     valid_membership: set[tuple[str, str]]
-    rule_model: RuleScorerModel | None = None
-    rule_scope: RuleServingScope | None = None
-    rule_scorer_fusion_weight: float = 1.25
-    content_model: ContentScorerModel | None = None
-    content_scope: ContentServingScope | None = None
-    content_scorer_fusion_weight: float = 5.0
-    scoring_config: ScoringConfig | None = None
-    fcn_scorer: FCNScorerModel | None = None
-    fcn_batch_size: int = 4096
+    ordering: OrderingConfig = field(default_factory=OrderingConfig)
+    parts: OrderingParts = field(default_factory=OrderingParts)
 
 
 def load_serving_context(
@@ -250,95 +236,28 @@ def load_serving_context(
 
 def with_scorers(
     context: ServingContext,
-    rule_model: RuleScorerModel | None,
-    content_model: ContentScorerModel | None,
-    rule_scorer_fusion_weight: float = 1.25,
-    content_scorer_fusion_weight: float = 5.0,
-    scoring_config: ScoringConfig | None = None,
-    fcn_scorer: FCNScorerModel | None = None,
-    fcn_batch_size: int = 4096,
+    ordering: OrderingConfig,
+    rule_model: RuleScorerModel | None = None,
+    content_model: ContentScorerModel | None = None,
+    fcn: dict[str, FcnModel] | None = None,
 ) -> ServingContext:
-    """Attach fitted scorers and their serving scopes at the context cutoff."""
-    loader = _interactions_loader(context.canonical)
+    """Attach an ordering and the serving scopes of the models it needs, at
+    the context cutoff. Models the ordering does not use are dropped."""
     return replace(
         context,
-        rule_model=rule_model,
-        rule_scope=rule_serving_scope(context.canonical, context.cutoff, rule_model, loader)
-        if rule_model is not None
-        else None,
-        rule_scorer_fusion_weight=rule_scorer_fusion_weight,
-        content_model=content_model,
-        content_scope=content_serving_scope(
-            context.canonical, context.cutoff, content_model, loader
-        )
-        if content_model is not None
-        else None,
-        content_scorer_fusion_weight=content_scorer_fusion_weight,
-        scoring_config=scoring_config
-        or resolve_scoring_config(legacy_fusion_weight=content_scorer_fusion_weight),
-        fcn_scorer=fcn_scorer,
-        fcn_batch_size=fcn_batch_size,
-    )
-
-
-def _score_fcn_candidates(
-    context: ServingContext,
-    candidates: pd.DataFrame,
-    scorer: FCNScorerModel,
-    chunk_size: int = 50_000,
-    batch_size: int = 4096,
-) -> np.ndarray:
-    """Build the existing cutoff-safe pair features and score in bounded chunks."""
-    from recsys_vnpt.canonical import select_content_metadata_as_of
-    from recsys_vnpt.engagement import historical_sequence_features
-
-    profiles = context.profiles
-    profile_columns = [
-        column for column in ("profile_id", "username") if column in profiles
-    ]
-    items = context.contents
-    versions = context.canonical / "content_versions.parquet"
-    if versions.is_file():
-        items = select_content_metadata_as_of(
-            pd.read_parquet(versions), context.cutoff
-        ).drop(columns=["tag_names"], errors="ignore")
-    sequence_enabled = "historical_content_sequence" in scorer.contract.multivalue_features
-    playback_path = context.canonical / "playback_events.parquet"
-    sequence = None
-    if sequence_enabled and playback_path.is_file():
-        sequence = historical_sequence_features(
-            pd.read_parquet(playback_path), context.cutoff
-        )
-
-    scores: list[np.ndarray] = []
-    for start in range(0, len(candidates), chunk_size):
-        part = candidates.iloc[start : start + chunk_size].copy()
-        pair_features = part.merge(
-            profiles[profile_columns].drop_duplicates("profile_id"),
-            on="profile_id",
-            how="left",
-        )
-        frame = build_pair_features(
-            pair_features,
-            context.interactions,
-            items,
-            context.users,
+        ordering=ordering,
+        parts=ordering_parts(
+            ordering,
+            context.canonical,
             context.cutoff,
-        )
-        if sequence is not None:
-            frame = frame.merge(sequence, on="profile_id", how="left")
-            for column in (
-                "historical_session_count",
-                "historical_playback_count",
-                "historical_sequence_depth",
-            ):
-                if column in frame:
-                    frame[column] = pd.to_numeric(
-                        frame[column], errors="coerce"
-                    ).fillna(0.0)
-        frame["rule_id"] = frame["candidate_rule_id"].astype("string")
-        scores.append(score_fcn_candidates(scorer, frame, batch_size=batch_size))
-    return np.concatenate(scores) if scores else np.empty(0, dtype=np.float32)
+            _interactions_loader(context.canonical),
+            context.interactions,
+            context.popularity,
+            rule_model=rule_model,
+            content_model=content_model,
+            fcn=fcn,
+        ),
+    )
 
 
 def order_candidates(
@@ -365,40 +284,15 @@ def order_candidates(
         ],
         cutoff=context.cutoff,
     )
-    if context.rule_model is not None:
-        rule_scores, rule_metrics = apply_rule_scorer(
-            context.rule_model,
-            context.rule_scope,
-            profiles["profile_id"].astype(str),
-            rule_scores,
-            context.rule_scorer_fusion_weight,
-        )
-        metrics.update(rule_metrics)
-    scoring_config = context.scoring_config or resolve_scoring_config()
-    fcn_scores = (
-        _score_fcn_candidates(
-            context,
-            candidate_pairs,
-            context.fcn_scorer,
-            batch_size=context.fcn_batch_size,
-        )
-        if context.fcn_scorer is not None
-        else None
+    candidate_pairs, rule_scores, ordering_metrics = apply_orderings(
+        context.ordering,
+        context.parts,
+        profiles["profile_id"].astype(str),
+        candidate_pairs,
+        rule_scores,
+        context.membership,
     )
-    if (
-        context.content_model is not None
-        or context.fcn_scorer is not None
-        or scoring_config.preset != "legacy"
-    ):
-        candidate_pairs, content_metrics = apply_content_scorer(
-            context.content_model,
-            context.content_scope,
-            candidate_pairs,
-            context.content_scorer_fusion_weight,
-            scoring_config=scoring_config,
-            fcn_scores=fcn_scores,
-        )
-        metrics.update(content_metrics)
+    metrics.update(ordering_metrics)
     return candidate_pairs, rule_scores, metrics
 
 
@@ -481,11 +375,10 @@ def serving_manifest_config(
     source_candidates_per_rule,
     gbdt_backend,
     gbdt_device,
-    scoring_config,
-    rule_gbdt_backend,
-    content_gbdt_backend,
-    fcn_batch_size,
-    fcn_checkpoint_hash,
+    content_rank_scope,
+    content_fcn_family,
+    routed_fallback,
+    fcn_model_dir,
 ) -> dict[str, Any]:
     """The config a serving run writes into its own manifest.
 
@@ -518,11 +411,10 @@ def serving_manifest_config(
         "source_candidates_per_rule": source_candidates_per_rule,
         "gbdt_backend": gbdt_backend,
         "gbdt_device": gbdt_device,
-        "scoring_config": scoring_config,
-        "rule_gbdt_backend": rule_gbdt_backend,
-        "content_gbdt_backend": content_gbdt_backend,
-        "fcn_batch_size": fcn_batch_size,
-        "fcn_checkpoint_hash": fcn_checkpoint_hash,
+        "content_rank_scope": content_rank_scope,
+        "content_fcn_family": content_fcn_family,
+        "routed_fallback": routed_fallback,
+        "fcn_model_dir": None if fcn_model_dir is None else str(fcn_model_dir),
     }
 
 
@@ -560,20 +452,16 @@ def popularity_live_test(
     source_candidates_per_rule: int = 20,
     gbdt_backend: str = "sklearn",
     gbdt_device: str = "auto",
-    scoring_config: ScoringConfig | None = None,
-    rule_scorer_model: RuleScorerModel | None = None,
-    content_scorer_model: ContentScorerModel | None = None,
-    fcn_scorer_model: FCNScorerModel | None = None,
-    rule_gbdt_backend: str | None = None,
-    content_gbdt_backend: str | None = None,
-    fcn_batch_size: int = 4096,
+    content_rank_scope: str = "rule",
+    content_fcn_family: str = "fcn_official",
+    routed_fallback: str = "learned_rrf",
+    fcn_model_dir: str | Path | None = None,
 ) -> MetricBundle:
     """Serve ``num_profiles`` profiles (0 serves all of them) and record metrics.
 
-    Unlike the batch path this fits the learned scorers on the spot. Legacy
-    ordering can fall back to the hand-built path; non-legacy compositions
-    require their configured scorers and fail if one cannot be trained. This
-    suits rehearsals rather than production.
+    Unlike the batch path this fits the learned scorers on the spot and falls
+    back to the hand-built ordering if they cannot train, so it suits
+    rehearsals rather than production.
     """
     if (
         num_profiles < 0
@@ -583,12 +471,6 @@ def popularity_live_test(
     ):
         raise ValueError("profile count/chunk size must be positive and repetitions nonnegative")
     root = Path(project_root).resolve()
-    scoring_config = scoring_config or resolve_scoring_config(
-        legacy_content_ordering=content_ordering,
-        legacy_fusion_weight=content_scorer_fusion_weight,
-    )
-    if scoring_config.uses_fcn and fcn_scorer_model is None:
-        raise ValueError("FCN composition requires a loaded FCN scorer model")
     observed_rss = [_rss_bytes()]
     stage_started = time.perf_counter()
     assembly_config = RuleAssemblyConfig(
@@ -626,46 +508,47 @@ def popularity_live_test(
     # hand-built ordering and the reason lands in the run metrics.
     fallback_metrics: dict[str, Any] = {}
     loader = _interactions_loader(context.canonical)
-    rule_model = rule_scorer_model
-    content_model = content_scorer_model
-    if rule_model is None and rule_ordering == "learned_rrf":
+    ordering = OrderingConfig(
+        rule_ordering=rule_ordering,
+        content_ordering=content_ordering,
+        content_rank_scope=content_rank_scope,
+        content_fcn_family=content_fcn_family,
+        routed_fallback=routed_fallback,
+        rule_scorer_fusion_weight=rule_scorer_fusion_weight,
+        content_scorer_fusion_weight=content_scorer_fusion_weight,
+    )
+    rule_model = content_model = None
+    if ordering.rule_gbdt:
         try:
             rule_model = train_rule_scorer(
-                context.canonical, loader, backend=rule_gbdt_backend or gbdt_backend, device=gbdt_device
+                context.canonical, loader, backend=gbdt_backend, device=gbdt_device
             )
         except Exception as error:  # noqa: BLE001 - enhancer must never kill publish
+            ordering = replace(ordering, rule_ordering="count")
             fallback_metrics.update(
                 {
                     "rule_ordering": "count_fallback",
                     "rule_ordering_fallback_reason": f"{type(error).__name__}: {error}",
                 }
             )
-    elif rule_ordering != "count":
-        raise ValueError(f"unsupported rule ordering: {rule_ordering}")
-    if content_model is None and scoring_config.uses_gbdt:
+    if ordering.content_gbdt:
         try:
             content_model = train_content_scorer(
-                context.canonical, cutoff, loader, backend=content_gbdt_backend or gbdt_backend, device=gbdt_device
+                context.canonical, cutoff, loader, backend=gbdt_backend, device=gbdt_device
             )
         except Exception as error:  # noqa: BLE001 - enhancer must never kill publish
+            ordering = replace(ordering, content_ordering="hand_sum")
             fallback_metrics.update(
                 {
                     "content_ordering": "hand_sum_fallback",
                     "content_ordering_fallback_reason": f"{type(error).__name__}: {error}",
                 }
             )
-    elif not scoring_config.uses_gbdt and content_ordering not in {"hand_sum", "learned_rrf"}:
-        raise ValueError(f"unsupported content ordering: {content_ordering}")
-    context = with_scorers(
-        context,
-        rule_model,
-        content_model,
-        rule_scorer_fusion_weight,
-        content_scorer_fusion_weight,
-        scoring_config,
-        fcn_scorer_model,
-        fcn_batch_size,
+    fcn = load_fcn_models(
+        fcn_model_dir or model_artifact_path(domain, "v2", project_root=root),
+        ordering.fcn_families,
     )
+    context = with_scorers(context, ordering, rule_model, content_model, fcn)
     candidate_pairs, all_profile_rule_scores, retrieval_metrics = order_candidates(
         context, profiles
     )
@@ -771,14 +654,7 @@ def popularity_live_test(
                 # Content ordering rewrites retrieval_score without changing a
                 # single (profile_id, content_id) pair, so it has to be part of
                 # the key or a re-run silently replays the previous ordering.
-                "content_ordering": [
-                    content_ordering,
-                    content_scorer_fusion_weight,
-                    scoring_config_payload(scoring_config),
-                    fcn_scorer_model.artifact_hash
-                    if fcn_scorer_model is not None
-                    else None,
-                ],
+                "ordering": asdict(ordering),
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -1162,15 +1038,10 @@ def popularity_live_test(
                 source_candidates_per_rule=source_candidates_per_rule,
                 gbdt_backend=gbdt_backend,
                 gbdt_device=gbdt_device,
-                scoring_config=scoring_config_payload(scoring_config),
-                rule_gbdt_backend=rule_gbdt_backend or gbdt_backend,
-                content_gbdt_backend=content_gbdt_backend or gbdt_backend,
-                fcn_batch_size=fcn_batch_size,
-                fcn_checkpoint_hash=(
-                    fcn_scorer_model.artifact_hash
-                    if fcn_scorer_model is not None
-                    else None
-                ),
+                content_rank_scope=content_rank_scope,
+                content_fcn_family=content_fcn_family,
+                routed_fallback=routed_fallback,
+                fcn_model_dir=fcn_model_dir,
             ),
         )
         bundle = MetricBundle(

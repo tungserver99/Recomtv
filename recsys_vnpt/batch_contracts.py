@@ -17,9 +17,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from recsys_vnpt.gbdt import GBDT_BACKENDS, GBDT_DEVICES
+from recsys_vnpt.orderings import OrderingConfig, expand_combination
 from recsys_vnpt.rule_assembly import PAGE_DEDUP_POLICIES, RuleAssemblyConfig
 from recsys_vnpt.runtime import atomic_write_text
-from recsys_vnpt.scoring_config import ScoringConfig, resolve_scoring_config
 from recsys_vnpt.source_manifest import sha256_file, stable_hash
 
 
@@ -100,26 +100,23 @@ class BatchConfig:
     content_ordering: str = "learned_rrf"
     rule_scorer_fusion_weight: float = 1.25
     content_scorer_fusion_weight: float = 5.0
-    gbdt_backend: str = "sklearn"
+    content_rank_scope: str = "profile"
+    content_fcn_family: str = "fcn_official"
+    routed_fallback: str = "learned_rrf"
+    gbdt_backend: str = "xgboost"
     gbdt_device: str = "auto"
-    scoring_preset: str = "legacy"
-    content_backends: tuple[str, ...] | None = None
-    content_rank_scope: str | None = None
-    content_fusion_weights: dict[str, float] | None = None
-    content_rrf_constant: float = 60.0
-    rule_gbdt_backend: str | None = None
-    content_gbdt_backend: str | None = None
-    fcn_checkpoint_path: str | None = None
-    fcn_contract_path: str | None = None
-    fcn_refresh: bool = False
-    fcn_device: str = "auto"
-    fcn_batch_size: int = 4096
+    fcn_epochs: int = 2
+    fcn_schedule_epochs: int = 30
     contents_per_rule_max: int = 30
     page_content_budget: int = 600
     page_dedup: str = "balanced_regret"
     gid: int = 3
     gate_max_regression: float = 0.02
     gate_evaluation_profiles: int = 5_000
+    # Inference serves this many profiles (a stable hash sample) instead of
+    # all of them; 0 serves all. For trial runs only: the delivery then
+    # covers part of the base.
+    max_profiles: int = 0
     sla_seconds: int = 6 * 3600
     qualification_workloads: tuple[int, ...] = (10_000, 100_000, 500_000, 1_000_000, 2_000_000)
     qualification_repetitions: int = 2
@@ -146,34 +143,20 @@ class BatchConfig:
             problems.append("page_content_budget must be within 200-600")
         if self.page_dedup not in PAGE_DEDUP_POLICIES:
             problems.append(f"page_dedup must be one of {PAGE_DEDUP_POLICIES}")
-        if self.rule_ordering not in {"count", "learned_rrf"}:
-            problems.append("rule_ordering must be count or learned_rrf")
-        if self.content_ordering not in {"hand_sum", "learned_rrf"}:
-            problems.append("content_ordering must be hand_sum or learned_rrf")
+        try:
+            self.ordering
+        except ValueError as error:
+            problems.append(str(error))
+        if not 1 <= self.fcn_epochs <= self.fcn_schedule_epochs:
+            problems.append("fcn_epochs must be within 1..fcn_schedule_epochs")
         if self.gbdt_backend not in GBDT_BACKENDS:
             problems.append(f"gbdt_backend must be one of {GBDT_BACKENDS}")
         if self.gbdt_device not in GBDT_DEVICES:
             problems.append(f"gbdt_device must be one of {GBDT_DEVICES}")
-        for name, backend in (
-            ("rule_gbdt_backend", self.resolved_rule_gbdt_backend),
-            ("content_gbdt_backend", self.resolved_content_gbdt_backend),
-        ):
-            if backend not in GBDT_BACKENDS:
-                problems.append(f"{name} must be one of {GBDT_BACKENDS}")
-        try:
-            self.resolved_scoring
-        except ValueError as error:
-            problems.append(str(error))
-        if self.fcn_device not in {"auto", "cpu", "cuda"}:
-            problems.append("fcn_device must be auto, cpu, or cuda")
-        if self.fcn_batch_size < 1:
-            problems.append("fcn_batch_size must be positive")
-        if (self.fcn_checkpoint_path is None) != (self.fcn_contract_path is None):
-            problems.append("fcn_checkpoint_path and fcn_contract_path must be set together")
-        if self.rule_scorer_fusion_weight <= 0 or self.content_scorer_fusion_weight <= 0:
-            problems.append("fusion weights must be positive")
         if not 0 <= self.gate_max_regression < 1:
             problems.append("gate_max_regression must be within [0, 1)")
+        if self.max_profiles < 0:
+            problems.append("max_profiles cannot be negative")
         if self.gate_evaluation_profiles < 1:
             problems.append("gate_evaluation_profiles must be positive")
         if self.input_wait_seconds < 0 or self.poll_seconds < 1:
@@ -186,42 +169,20 @@ class BatchConfig:
             raise BatchError("CONFIG_INVALID", "; ".join(problems))
 
     @property
+    def ordering(self) -> OrderingConfig:
+        return OrderingConfig(
+            rule_ordering=self.rule_ordering,
+            content_ordering=self.content_ordering,
+            content_rank_scope=self.content_rank_scope,
+            content_fcn_family=self.content_fcn_family,
+            routed_fallback=self.routed_fallback,
+            rule_scorer_fusion_weight=self.rule_scorer_fusion_weight,
+            content_scorer_fusion_weight=self.content_scorer_fusion_weight,
+        )
+
+    @property
     def uses_learned_scorers(self) -> bool:
-        scoring = self.resolved_scoring
-        return (
-            self.rule_ordering == "learned_rrf"
-            or scoring.uses_gbdt
-            or scoring.uses_fcn
-            or self.scoring_preset.lower() in {"gxgp", "gxep"}
-        )
-
-    @property
-    def resolved_rule_gbdt_backend(self) -> str:
-        if self.rule_gbdt_backend is not None:
-            return self.rule_gbdt_backend
-        if self.scoring_preset.lower() in {"gxgp", "gxep"}:
-            return "xgboost"
-        return self.gbdt_backend
-
-    @property
-    def resolved_content_gbdt_backend(self) -> str:
-        if self.content_gbdt_backend is not None:
-            return self.content_gbdt_backend
-        if self.scoring_preset.lower() in {"gxgp", "gxep"}:
-            return "xgboost"
-        return self.gbdt_backend
-
-    @property
-    def resolved_scoring(self) -> ScoringConfig:
-        return resolve_scoring_config(
-            preset=self.scoring_preset,
-            content_backends=self.content_backends,
-            rank_scope=self.content_rank_scope,
-            weights=self.content_fusion_weights,
-            legacy_content_ordering=self.content_ordering,
-            legacy_fusion_weight=self.content_scorer_fusion_weight,
-            rrf_constant=self.content_rrf_constant,
-        )
+        return self.ordering.needs_models
 
     @property
     def assembly(self) -> RuleAssemblyConfig:
@@ -253,14 +214,26 @@ def load_config(path: str | Path) -> BatchConfig:
         raise BatchError("CONFIG_INVALID", f"cannot read {path}: {error}") from error
     if not isinstance(raw, dict):
         raise BatchError("CONFIG_INVALID", "config must be a JSON object")
+    # A named combination (orderings.COMBINATIONS) fills in the ordering keys;
+    # setting one of them differently as well is a contradiction, not an override.
+    combination = raw.pop("combination", None)
+    if combination is not None:
+        try:
+            preset = expand_combination(combination)
+        except ValueError as error:
+            raise BatchError("CONFIG_INVALID", str(error)) from error
+        clashes = sorted(name for name, value in preset.items() if name in raw and raw[name] != value)
+        if clashes:
+            raise BatchError(
+                "CONFIG_INVALID", f"combination {combination} sets {clashes}, which the config sets differently"
+            )
+        raw = {**raw, **preset}
     known = {item.name for item in fields(BatchConfig)}
     unknown = sorted(set(raw) - known)
     if unknown:
         raise BatchError("CONFIG_INVALID", f"unknown config keys: {unknown}")
     if "qualification_workloads" in raw:
         raw["qualification_workloads"] = tuple(raw["qualification_workloads"])
-    if raw.get("content_backends") is not None:
-        raw["content_backends"] = tuple(raw["content_backends"])
     try:
         return BatchConfig(**raw)
     except TypeError as error:

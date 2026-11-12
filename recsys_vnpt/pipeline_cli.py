@@ -8,8 +8,8 @@ from recsys_vnpt.engagement import (
     DEFAULT_TARGET_VERSION,
 )
 from recsys_vnpt.gbdt import GBDT_BACKENDS, GBDT_DEVICES
-from recsys_vnpt.fcn_scorer import load_fcn_scorer
 from recsys_vnpt.implicit_baselines import IMPLICIT_BASELINE_FAMILIES
+from recsys_vnpt.orderings import add_ordering_arguments, apply_combination
 from recsys_vnpt.rule_assembly import PAGE_DEDUP_POLICIES
 
 from recsys_vnpt.pipeline_v2 import (
@@ -19,15 +19,6 @@ from recsys_vnpt.pipeline_v2 import (
     popularity_live_test,
     prepare_canonical_project,
     train_temporal_model,
-)
-from recsys_vnpt.scorer_bundle import bundle_fcn_artifact_paths, load_bundle
-from recsys_vnpt.scoring_config import (
-    CONTENT_BACKENDS,
-    PRESETS,
-    RANK_SCOPES,
-    ScoringConfig,
-    resolve_scoring_config,
-    scoring_config_payload,
 )
 
 MODEL_FAMILIES = (
@@ -55,16 +46,7 @@ def _add_scoring_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--source-candidates-per-rule", type=int, default=33)
     parser.add_argument("--rule-affinity", choices=("count", "gain"), default="count")
     parser.add_argument("--rule-affinity-half-life-days", type=float)
-    parser.add_argument(
-        "--rule-ordering", choices=("count", "learned_rrf"), default="learned_rrf"
-    )
-    parser.add_argument("--rule-scorer-fusion-weight", type=float, default=1.25)
-    parser.add_argument(
-        "--content-ordering",
-        choices=("hand_sum", "learned_rrf"),
-        default="learned_rrf",
-    )
-    parser.add_argument("--content-scorer-fusion-weight", type=float, default=5.0)
+    add_ordering_arguments(parser)
     parser.add_argument("--contents-per-rule-max", type=int, default=30)
     parser.add_argument("--page-content-budget", type=int, default=600)
     parser.add_argument(
@@ -81,104 +63,8 @@ def _add_scoring_arguments(parser: argparse.ArgumentParser) -> None:
 def _add_gbdt_arguments(parser: argparse.ArgumentParser) -> None:
     """Library and device of the learned scorers, wherever a run fits them."""
 
-    parser.add_argument("--gbdt-backend", choices=GBDT_BACKENDS, default="sklearn")
+    parser.add_argument("--gbdt-backend", choices=GBDT_BACKENDS, default="xgboost")
     parser.add_argument("--gbdt-device", choices=GBDT_DEVICES, default="auto")
-
-
-def _add_composition_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--scoring-preset", choices=tuple(PRESETS.values()), default="legacy"
-    )
-    parser.add_argument(
-        "--content-backends", nargs="+", choices=CONTENT_BACKENDS
-    )
-    parser.add_argument("--content-rank-scope", choices=RANK_SCOPES)
-    parser.add_argument("--content-heuristic-weight", type=float)
-    parser.add_argument("--content-gbdt-weight", type=float)
-    parser.add_argument("--content-fcn-weight", type=float)
-    if "--content-rrf-constant" not in parser._option_string_actions:
-        parser.add_argument("--content-rrf-constant", type=float, default=60.0)
-    parser.add_argument("--rule-gbdt-backend", choices=GBDT_BACKENDS)
-    parser.add_argument("--content-gbdt-backend", choices=GBDT_BACKENDS)
-    parser.add_argument("--scorer-bundle")
-    parser.add_argument("--content-fcn-checkpoint")
-    parser.add_argument("--content-fcn-contract")
-    parser.add_argument("--content-fcn-device", choices=GBDT_DEVICES, default="auto")
-    parser.add_argument("--content-fcn-batch-size", type=int, default=4096)
-
-
-def _composition_options(args) -> dict:
-    weights = {
-        key: value
-        for key, value in (
-            ("heuristic", args.content_heuristic_weight),
-            ("gbdt", args.content_gbdt_weight),
-            ("fcn", args.content_fcn_weight),
-        )
-        if value is not None
-    }
-    scoring = resolve_scoring_config(
-        preset=args.scoring_preset,
-        content_backends=args.content_backends,
-        rank_scope=args.content_rank_scope,
-        weights=weights or None,
-        legacy_content_ordering=args.content_ordering,
-        legacy_fusion_weight=args.content_scorer_fusion_weight,
-        rrf_constant=args.content_rrf_constant,
-    )
-    preset_backend = (
-        "xgboost"
-        if args.scoring_preset.lower() in {"gxgp", "gxep"}
-        else args.gbdt_backend
-    )
-    rule_backend = args.rule_gbdt_backend or preset_backend
-    content_backend = args.content_gbdt_backend or preset_backend
-    rule_model = content_model = fcn_model = None
-    bundle_manifest = None
-    bundle_paths = None
-    if args.scorer_bundle:
-        rule_model, content_model, bundle_manifest = load_bundle(args.scorer_bundle)
-        bundle_paths = bundle_fcn_artifact_paths(args.scorer_bundle, bundle_manifest)
-        stored = bundle_manifest.get("scoring_config")
-        expected = scoring_config_payload(scoring)
-        if stored is None and scoring.preset != "legacy":
-            raise ValueError(
-                "scorer bundle has no composition metadata; retrain before using a non-legacy preset"
-            )
-        if stored is not None and stored != expected:
-            raise ValueError("scorer bundle does not match the requested composition")
-        for key, requested in (
-            ("rule_ordering", args.rule_ordering),
-            ("content_ordering", args.content_ordering),
-            ("rule_gbdt_backend", rule_backend),
-            ("content_gbdt_backend", content_backend),
-        ):
-            recorded = bundle_manifest.get(key)
-            if recorded is not None and recorded != requested:
-                raise ValueError(
-                    f"scorer bundle {key}={recorded!r} does not match requested {requested!r}"
-                )
-    checkpoint = args.content_fcn_checkpoint
-    contract = args.content_fcn_contract
-    if (checkpoint is None) != (contract is None):
-        raise ValueError("both --content-fcn-checkpoint and --content-fcn-contract are required")
-    if scoring.uses_fcn:
-        if checkpoint and contract:
-            paths = (checkpoint, contract)
-        elif bundle_paths:
-            paths = bundle_paths
-        else:
-            raise ValueError("FCN is active; pass checkpoint/contract or a bundle containing them")
-        fcn_model = load_fcn_scorer(*paths, device=args.content_fcn_device)
-    return {
-        "scoring_config": scoring,
-        "rule_scorer_model": rule_model,
-        "content_scorer_model": content_model,
-        "fcn_scorer_model": fcn_model,
-        "rule_gbdt_backend": rule_backend,
-        "content_gbdt_backend": content_backend,
-        "fcn_batch_size": args.content_fcn_batch_size,
-    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -288,13 +174,13 @@ def main(argv: list[str] | None = None) -> int:
         default=False,
     )
     baseline.add_argument("--content-external-rrf-weight", type=float, default=0.0)
+    baseline.add_argument("--content-rrf-constant", type=int, default=60)
     baseline.add_argument("--recency-candidates-per-rule", type=int, default=8)
     baseline.add_argument("--recency-reserved-per-rule", type=int, default=8)
     baseline.add_argument("--recency-max-age-days", type=int, default=30)
     baseline.add_argument("--cowatch-candidates-per-rule", type=int, default=0)
     baseline.add_argument("--tag-candidates-per-rule", type=int, default=0)
     _add_scoring_arguments(baseline)
-    _add_composition_arguments(baseline)
     baseline.add_argument(
         "--sequence-mode", choices=("none", "historical"), default="none"
     )
@@ -325,7 +211,6 @@ def main(argv: list[str] | None = None) -> int:
     evaluate.add_argument("--recency-reserved-per-rule", type=int, default=8)
     evaluate.add_argument("--recency-max-age-days", type=int, default=30)
     _add_scoring_arguments(evaluate)
-    _add_composition_arguments(evaluate)
 
     live = sub.add_parser("live-test")
     live.add_argument("--domain", choices=("all", "clip", "movie", "music"), default="all")
@@ -351,20 +236,7 @@ def main(argv: list[str] | None = None) -> int:
     live.add_argument("--run-id")
     live.add_argument("--candidate-budget", type=int, default=1000)
     live.add_argument("--exact-cowatch", action="store_true")
-    live.add_argument(
-        "--rule-ordering",
-        choices=("count", "learned_rrf"),
-        default="learned_rrf",
-    )
-    live.add_argument("--rule-scorer-fusion-weight", type=float, default=1.25)
-    live.add_argument(
-        "--content-ordering",
-        choices=("hand_sum", "learned_rrf"),
-        default="learned_rrf",
-    )
-    live.add_argument(
-        "--content-scorer-fusion-weight", type=float, default=5.0
-    )
+    add_ordering_arguments(live)
     live.add_argument("--contents-per-rule-max", type=int, default=30)
     live.add_argument("--page-content-budget", type=int, default=600)
     live.add_argument(
@@ -379,9 +251,8 @@ def main(argv: list[str] | None = None) -> int:
     live.add_argument("--reserved-per-rule", type=int, default=33)
     live.add_argument("--source-candidates-per-rule", type=int, default=33)
     _add_gbdt_arguments(live)
-    _add_composition_arguments(live)
 
-    args = parser.parse_args(argv)
+    args = apply_combination(parser.parse_args(argv))
     if args.command == "prepare":
         paths, metrics = prepare_canonical_project(
             args.root,
@@ -435,7 +306,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps({"run_id": bundle.manifest.run_id, "training": bundle.training}, indent=2))
     elif args.command == "evaluate-baseline":
-        composition = _composition_options(args)
         bundle = evaluate_popularity_baseline(
             args.root,
             args.domain,
@@ -486,10 +356,13 @@ def main(argv: list[str] | None = None) -> int:
             rule_scorer_fusion_weight=args.rule_scorer_fusion_weight,
             content_ordering=args.content_ordering,
             content_scorer_fusion_weight=args.content_scorer_fusion_weight,
-            **composition,
             contents_per_rule_max=args.contents_per_rule_max,
             page_content_budget=args.page_content_budget,
             page_dedup=args.page_dedup,
+            content_rank_scope=args.content_rank_scope,
+            content_fcn_family=args.content_fcn_family,
+            routed_fallback=args.routed_fallback,
+            fcn_model_dir=args.fcn_model_dir,
         )
         print(
             json.dumps(
@@ -516,7 +389,6 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     elif args.command == "evaluate":
-        composition = _composition_options(args)
         bundle = evaluate_temporal_model(
             args.root,
             args.domain,
@@ -550,10 +422,13 @@ def main(argv: list[str] | None = None) -> int:
             rule_scorer_fusion_weight=args.rule_scorer_fusion_weight,
             content_ordering=args.content_ordering,
             content_scorer_fusion_weight=args.content_scorer_fusion_weight,
-            **composition,
             contents_per_rule_max=args.contents_per_rule_max,
             page_content_budget=args.page_content_budget,
             page_dedup=args.page_dedup,
+            content_rank_scope=args.content_rank_scope,
+            content_fcn_family=args.content_fcn_family,
+            routed_fallback=args.routed_fallback,
+            fcn_model_dir=args.fcn_model_dir,
         )
         print(
             json.dumps(
@@ -580,7 +455,6 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     else:
-        composition = _composition_options(args)
         bundle = popularity_live_test(
             args.root,
             args.domain,
@@ -615,7 +489,10 @@ def main(argv: list[str] | None = None) -> int:
             source_candidates_per_rule=args.source_candidates_per_rule,
             gbdt_backend=args.gbdt_backend,
             gbdt_device=args.gbdt_device,
-            **composition,
+            content_rank_scope=args.content_rank_scope,
+            content_fcn_family=args.content_fcn_family,
+            routed_fallback=args.routed_fallback,
+            fcn_model_dir=args.fcn_model_dir,
         )
         print(json.dumps({"run_id": bundle.manifest.run_id, "inference": bundle.inference, "output": bundle.output}, indent=2))
     return 0

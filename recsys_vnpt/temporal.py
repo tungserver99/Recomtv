@@ -280,8 +280,12 @@ def build_pair_features(
     cutoff: str | pd.Timestamp,
     time_col: str = "create_date",
     behavior: pd.DataFrame | None = None,
+    profile_features: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    profile_features = historical_profile_features(interactions, cutoff, time_col=time_col)
+    """``profile_features``, when given, replaces the history aggregation over
+    ``interactions``, so callers scoring in chunks aggregate it once."""
+    if profile_features is None:
+        profile_features = historical_profile_features(interactions, cutoff, time_col=time_col)
     output = pairs.copy()
     output["profile_id"] = output["profile_id"].astype("string")
     output["content_id"] = output["content_id"].astype("string")

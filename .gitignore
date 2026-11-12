@@ -3,7 +3,7 @@
 *.xls
 month_mytv_info.parquet
 
-# Raw datasets and generated recommendation outputs
+# Raw/source input data
 /data/
 /rs_output/
 /reports/
@@ -19,16 +19,16 @@ month_mytv_info.parquet
 **/result_v3_fcn/
 **/checkpoints/
 **/runs/
-
-# Local environments and Python caches
 .venv/
+
+# Local pytest/runtime caches
 .pytest_cache/
 .pytest_tmp/
 .pytest_cache_run/
 pytest-cache-files-*/
 __pycache__/
 
-# Transient logs and temporary files
+# Transient experiment process logs
 *.stdout.log
 *.stderr.log
 *.log
@@ -36,7 +36,7 @@ __pycache__/
 *.bak
 *.swp
 
-# OS/editor files and empty scratch notebooks
+# OS/editor files and scratch notebooks
 .DS_Store
 Thumbs.db
 /Untitled*.ipynb

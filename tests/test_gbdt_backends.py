@@ -63,18 +63,6 @@ def test_a_gpu_request_without_a_gpu_fails_training_but_serving_falls_back(monke
     assert gbdt.resolve_device("auto", strict=True) == "cpu"
 
 
-def test_strict_serving_device_refuses_cuda_fallback(monkeypatch):
-    head = gbdt.XGBoostHead(
-        [False], "auto", seed=42, learning_rate=0.06, max_iter=2,
-        max_leaf_nodes=3, min_samples_leaf=1, l2_regularization=1.0,
-    )
-    model = type("Model", (), {"heads": {"head": head}})()
-    monkeypatch.setattr(gbdt, "cuda_available", lambda: False)
-
-    with pytest.raises(RuntimeError, match="no CUDA GPU"):
-        gbdt.serve_on(model, "cuda")
-
-
 def test_unknown_backend_or_device_is_refused():
     with pytest.raises(ValueError):
         gbdt.make_head("lightgbm", "cpu", [False], **HEAD)

@@ -31,11 +31,11 @@ git clone https://github.com/Itvc0110/RecSys-VNPT.git && cd RecSys-VNPT
 python -m pip install -r requirements.txt
 ```
 
-Yêu cầu Python 3.10 trở lên. Luồng batch chạy trên CPU; các wheel CUDA trong
-`requirements-cuda.txt` chỉ cần cho các mô hình neural phục vụ nghiên cứu.
-`scikit-learn` được ghim phiên bản vì bundle huấn luyện bằng phiên bản khác sẽ bị
-từ chối thay vì được tin dùng; máy chủ retrain và máy chủ inference phải cài cùng
-một bộ requirements. Khi triển khai không kèm `.git`, đặt
+Yêu cầu Python 3.10 trở lên. Luồng batch chạy được trên CPU; scorer XGBoost và
+FCN dùng GPU CUDA khi máy có, với wheel CUDA trong `requirements-cuda.txt`.
+`scikit-learn` và `xgboost` được ghim phiên bản vì bundle huấn luyện bằng phiên
+bản khác sẽ bị từ chối thay vì được tin dùng; máy chủ retrain và máy chủ inference
+phải cài cùng một bộ requirements. Khi triển khai không kèm `.git`, đặt
 `RECSYS_VNPT_CODE_VERSION` bằng tag phát hành để mọi báo cáo ghi lại code nào đã
 tạo ra nó.
 
@@ -127,14 +127,20 @@ mẫu đầy đủ.
 | `candidate_budget` | 1000 | số nội dung retrieval lấy cho mỗi profile |
 | `candidate_rules`, `reserved_per_rule`, `source_candidates_per_rule` | 30, 33, 33 | số rule retrieval lấy cho mỗi profile, số nội dung giữ chỗ trong mỗi rule, và độ sâu nguồn của mỗi rule; `candidate_rules × reserved_per_rule` phải nằm trong ngân sách |
 | `recency_candidates_per_rule`, `recency_reserved_per_rule`, `recency_max_age_days` | 8, 8, 30 | kênh retrieval recency: các nội dung mới nhất của mỗi rule, được giữ chỗ trong pool |
-| `rule_ordering`, `content_ordering` | `learned_rrf` | `count`/`hand_sum` phục vụ thứ tự heuristic và không cần bundle |
+| `combination` | không có (tức `GxGp`) | tên một tổ hợp trong `orderings.COMBINATIONS`; điền sẵn các key thứ tự bên dưới, xem `README.md` |
+| `rule_ordering` | `learned_rrf` | thứ tự hàng: `count` (heuristic), `learned_rrf` (GBDT), `fcn` (`hierarchical_fcn`), `segment` (heuristic theo nhóm) |
+| `content_ordering` | `learned_rrf` | thứ tự nội dung: `hand_sum` (heuristic), `learned_rrf` (GBDT), `fcn`, `fcn_rrf`, `ensemble`, `routed`, `segment` |
+| `content_rank_scope` | `profile` | RRF của thứ tự nội dung tính trong từng khối (`rule`) hay trên toàn profile (`profile`) |
+| `content_fcn_family`, `routed_fallback` | `fcn_official`, `learned_rrf` | FCN dùng cho nội dung; mô hình cho profile ngoài vocabulary của FCN khi `content_ordering` là `routed` |
 | `rule_scorer_fusion_weight`, `content_scorer_fusion_weight` | 1.25, 5.0 | trọng số RRF của từng scorer học được |
-| `gbdt_backend`, `gbdt_device` | `sklearn`, `auto` | thư viện của hai scorer (`sklearn` chỉ chạy CPU; `xgboost` chạy GPU CUDA) và thiết bị (`auto`, `cuda`, `cpu`); `auto` dùng GPU nếu có |
+| `gbdt_backend`, `gbdt_device` | `xgboost`, `auto` | thư viện của hai scorer (`sklearn` chỉ chạy CPU; `xgboost` chạy GPU CUDA) và thiết bị (`auto`, `cuda`, `cpu`); `auto` dùng GPU nếu có |
+| `fcn_epochs`, `fcn_schedule_epochs` | 2, 30 | số epoch train FCN trong retrain và độ dài lịch learning rate cosine |
 | `contents_per_rule_max`, `page_content_budget` | 30, 600 | trần mỗi hàng và ngân sách toàn trang |
 | `page_dedup` | `balanced_regret` | chính sách khử trùng lặp toàn trang |
 | `gid` | 3 | nhóm A/B ghi vào file grouping cho đến khi VNPT định nghĩa |
 | `gate_max_regression` | 0.02 | mức giảm tương đối tối đa của bundle mới so với bundle đang promote |
 | `gate_evaluation_profiles` | 5000 | số profile lấy mẫu cho gate retrain; mỗi lượt đánh giá chạy trong process riêng và bộ nhớ tăng theo giá trị này |
+| `max_profiles` | 0 | số profile mà inference tạo trang, lấy mẫu cố định theo SHA-256 của `profile_id`; 0 là mọi profile. Chỉ dùng cho lượt thử, với `delivery_root` riêng |
 | `sla_seconds` | 21600 | ngân sách thời gian mỗi chu kỳ, được inference và qualification báo cáo |
 | `qualification_workloads`, `qualification_repetitions` | 10k…2M, 2 | các mức workload tăng dần khi qualification |
 
@@ -144,13 +150,13 @@ trang, nên các shard tính theo cấu hình cũ sẽ được tính lại thay
 ## 6. Chi tiết từng job
 
 **Retrain** kiểm tra đầu vào, chuẩn bị dữ liệu canonical và các cửa sổ temporal
-tương đối, fit cả hai scorer học được, rồi ghi một bundle. Sau đó job đánh giá
-trên cửa sổ test theo thời gian, bằng đúng code đã tạo ra bằng chứng để promote:
-thứ tự heuristic (hand-built), bundle mới, và bundle đang promote nếu có. Gate
-(`work/batches/<id>/retrain/gate.json`) chỉ đạt khi cửa sổ có positive mới, bundle
-mới tốt ít nhất bằng thứ tự heuristic trên `rule_ndcg@20` và
-`macro_content_ndcg@10`, và không thấp hơn bundle đang promote quá
-`gate_max_regression`. Đạt: con trỏ được di chuyển. Không đạt: trạng thái
+tương đối, fit cả hai scorer học được và các FCN mà tổ hợp cấu hình cần, rồi ghi
+một bundle. Sau đó job đánh giá trên cửa sổ test theo thời gian, bằng đúng code
+đã tạo ra bằng chứng để promote: bundle mới, và bundle đang promote nếu có, cả hai
+theo tổ hợp đang cấu hình. Gate (`work/batches/<id>/retrain/gate.json`) chỉ đạt
+khi cửa sổ có positive mới và bundle mới không thấp hơn bundle đang promote quá
+`gate_max_regression` trên `rule_ndcg@20` và `macro_content_ndcg@10`. Gate không
+còn so với thứ tự heuristic. Đạt: con trỏ được di chuyển. Không đạt: trạng thái
 `REJECTED`, exit 22, con trỏ giữ nguyên.
 
 **Inference** kiểm tra đầu vào, chuẩn bị dữ liệu canonical (dùng chung với lượt

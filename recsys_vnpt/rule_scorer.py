@@ -8,7 +8,6 @@ count-affinity ranks.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -574,51 +573,3 @@ def apply_rule_scorer(
         },
     }
     return fused[["profile_id", "rule_id", "rule_score"]], metrics
-
-
-def learned_rule_ordering_scores(
-    canonical: Path,
-    cutoff: pd.Timestamp,
-    profiles: pd.Series,
-    incumbent_scores: pd.DataFrame,
-    interactions_loader: Callable[[set[str], list[str]], pd.DataFrame],
-    evaluation_split: str = "test",
-    fusion_weight: float = 1.25,
-    **fit_parameters: Any,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Fit the graded scorer pre-cutoff and RRF-fuse with incumbent affinity."""
-    if fusion_weight <= 0:
-        raise ValueError("rule scorer fusion weight must be positive")
-    started = time.perf_counter()
-    normal_membership, rule_index = normal_rule_index(canonical)
-    windows = training_windows(canonical, evaluation_split)
-    window_scopes = {
-        window.name: membership_and_rules_as_of(
-            canonical, window.history_end, normal_membership, rule_index
-        )
-        for window in windows
-    }
-    membership, rules, scope_metrics, evaluation_ids = membership_and_rules_as_of(
-        canonical, cutoff, normal_membership, rule_index
-    )
-    # One load serves both the fit and the serving features.
-    interactions = interactions_loader(
-        set(evaluation_ids).union(*(scope[3] for scope in window_scopes.values())),
-        INTERACTION_COLUMNS,
-    )
-    model = fit_rule_scorer(
-        canonical, interactions, windows, window_scopes, rule_index, **fit_parameters
-    )
-    scope = RuleServingScope(
-        cutoff=cutoff,
-        membership=membership,
-        rules=rules,
-        metrics=scope_metrics,
-        interactions=interactions,
-        history=rule_history(interactions, cutoff, membership),
-    )
-    fused, metrics = apply_rule_scorer(
-        model, scope, profiles, incumbent_scores, fusion_weight
-    )
-    metrics["rule_scorer_seconds"] = time.perf_counter() - started
-    return fused, metrics

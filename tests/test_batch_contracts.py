@@ -107,48 +107,6 @@ def test_config_rejects_unknown_keys_and_impossible_pages(tmp_path):
         load_config(path.with_name("missing.json"))
 
 
-def test_new_scoring_presets_resolve_without_changing_legacy_defaults(tmp_path):
-    legacy = BatchConfig("i", "w", "d", "m")
-    assert legacy.resolved_scoring.preset == "legacy"
-    assert legacy.resolved_scoring.rank_scope == "per_rule"
-    assert legacy.resolved_rule_gbdt_backend == "sklearn"
-    assert legacy.resolved_content_gbdt_backend == "sklearn"
-
-    gxgp = BatchConfig("i", "w", "d", "m", scoring_preset="GxGp")
-    gxep = BatchConfig("i", "w", "d", "m", scoring_preset="GxEp")
-    assert gxgp.resolved_scoring.content_backends == ("heuristic", "gbdt")
-    assert gxgp.resolved_scoring.rank_scope == "profile"
-    assert gxgp.resolved_rule_gbdt_backend == "xgboost"
-    assert not gxgp.resolved_scoring.uses_fcn
-    assert gxep.resolved_scoring.content_backends == ("heuristic", "gbdt", "fcn")
-    assert gxep.resolved_content_gbdt_backend == "xgboost"
-    assert gxep.resolved_scoring.uses_fcn
-
-
-def test_batch_config_loads_json_component_lists_as_immutable_tuples(tmp_path):
-    path = tmp_path / "config.json"
-    path.write_text(
-        json.dumps(
-            {
-                "incoming_root": "i",
-                "work_root": "w",
-                "delivery_root": "d",
-                "model_registry": "m",
-                "scoring_preset": "custom",
-                "content_backends": ["heuristic", "fcn"],
-                "content_rank_scope": "profile",
-                "content_fusion_weights": {"heuristic": 1.0, "fcn": 0.5},
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    config = load_config(path)
-
-    assert config.content_backends == ("heuristic", "fcn")
-    assert config.resolved_scoring.weights["fcn"] == 0.5
-
-
 def test_batch_errors_survive_a_process_boundary():
     error = pickle.loads(pickle.dumps(BatchError("OUTPUT_INVALID", "shard 3")))
     assert (error.code, error.message, error.exit_code) == ("OUTPUT_INVALID", "shard 3", 40)

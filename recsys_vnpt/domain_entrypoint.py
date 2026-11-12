@@ -9,6 +9,7 @@ from recsys_vnpt.engagement import (
     DEFAULT_TARGET_VERSION,
 )
 from recsys_vnpt.gbdt import GBDT_BACKENDS, GBDT_DEVICES
+from recsys_vnpt.orderings import add_ordering_arguments, apply_combination
 from recsys_vnpt.implicit_baselines import IMPLICIT_BASELINE_FAMILIES
 from recsys_vnpt.rule_assembly import PAGE_DEDUP_POLICIES
 from recsys_vnpt.paths import data_artifact_path
@@ -20,7 +21,6 @@ from recsys_vnpt.pipeline_v2 import (
     prepare_canonical_project,
     train_temporal_model,
 )
-from recsys_vnpt.pipeline_cli import _add_composition_arguments, _composition_options
 
 
 MODEL_FAMILIES = (
@@ -60,7 +60,7 @@ def _add_raw_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_gbdt_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--gbdt-backend", choices=GBDT_BACKENDS, default="sklearn")
+    parser.add_argument("--gbdt-backend", choices=GBDT_BACKENDS, default="xgboost")
     parser.add_argument("--gbdt-device", choices=GBDT_DEVICES, default="auto")
 
 
@@ -164,20 +164,7 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
             "--rule-affinity", choices=("count", "gain"), default="count"
         )
         parser.add_argument("--rule-affinity-half-life-days", type=float)
-        parser.add_argument(
-            "--rule-ordering",
-            choices=("count", "learned_rrf"),
-            default="learned_rrf",
-        )
-        parser.add_argument("--rule-scorer-fusion-weight", type=float, default=1.25)
-        parser.add_argument(
-            "--content-ordering",
-            choices=("hand_sum", "learned_rrf"),
-            default="learned_rrf",
-        )
-        parser.add_argument(
-            "--content-scorer-fusion-weight", type=float, default=5.0
-        )
+        add_ordering_arguments(parser)
         parser.add_argument("--contents-per-rule-max", type=int, default=30)
         parser.add_argument("--page-content-budget", type=int, default=600)
         parser.add_argument(
@@ -201,7 +188,6 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
         parser.add_argument("--max-eval-profiles", type=int)
         parser.add_argument("--eval-profile-seed", type=int, default=42)
         _add_gbdt_options(parser)
-        _add_composition_arguments(parser)
     elif operation == "infer":
         parser.add_argument("--model-family", choices=("per_rule_popularity", *MODEL_FAMILIES), default="per_rule_popularity")
         parser.add_argument(
@@ -227,20 +213,7 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
         parser.add_argument("--run-id")
         parser.add_argument("--candidate-budget", type=int, default=1000)
         parser.add_argument("--exact-cowatch", action="store_true")
-        parser.add_argument(
-            "--rule-ordering",
-            choices=("count", "learned_rrf"),
-            default="learned_rrf",
-        )
-        parser.add_argument("--rule-scorer-fusion-weight", type=float, default=1.25)
-        parser.add_argument(
-            "--content-ordering",
-            choices=("hand_sum", "learned_rrf"),
-            default="learned_rrf",
-        )
-        parser.add_argument(
-            "--content-scorer-fusion-weight", type=float, default=5.0
-        )
+        add_ordering_arguments(parser)
         parser.add_argument("--contents-per-rule-max", type=int, default=30)
         parser.add_argument("--page-content-budget", type=int, default=600)
         parser.add_argument(
@@ -255,13 +228,11 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
         parser.add_argument("--reserved-per-rule", type=int, default=33)
         parser.add_argument("--source-candidates-per-rule", type=int, default=33)
         _add_gbdt_options(parser)
-        _add_composition_arguments(parser)
         _add_raw_options(parser)
     else:
         raise ValueError(f"Unsupported domain operation: {operation}")
 
-    args = parser.parse_args(argv)
-    composition = _composition_options(args) if operation in {"evaluate", "infer"} else {}
+    args = apply_combination(parser.parse_args(argv))
     root = Path(args.root).resolve()
     if operation in {"train", "infer"}:
         _prepare_if_requested(args, domain, root)
@@ -340,12 +311,15 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
                 rule_scorer_fusion_weight=args.rule_scorer_fusion_weight,
                 content_ordering=args.content_ordering,
                 content_scorer_fusion_weight=args.content_scorer_fusion_weight,
-                **composition,
                 contents_per_rule_max=args.contents_per_rule_max,
                 page_content_budget=args.page_content_budget,
                 page_dedup=args.page_dedup,
                 gbdt_backend=args.gbdt_backend,
                 gbdt_device=args.gbdt_device,
+                content_rank_scope=args.content_rank_scope,
+                content_fcn_family=args.content_fcn_family,
+                routed_fallback=args.routed_fallback,
+                fcn_model_dir=args.fcn_model_dir,
             )
         else:
             bundle = evaluate_temporal_model(
@@ -381,10 +355,13 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
                 rule_scorer_fusion_weight=args.rule_scorer_fusion_weight,
                 content_ordering=args.content_ordering,
                 content_scorer_fusion_weight=args.content_scorer_fusion_weight,
-                **composition,
                 contents_per_rule_max=args.contents_per_rule_max,
                 page_content_budget=args.page_content_budget,
                 page_dedup=args.page_dedup,
+                content_rank_scope=args.content_rank_scope,
+                content_fcn_family=args.content_fcn_family,
+                routed_fallback=args.routed_fallback,
+                fcn_model_dir=args.fcn_model_dir,
             )
         payload = {"run_id": bundle.manifest.run_id, "evaluation": bundle.evaluation}
     else:
@@ -422,7 +399,10 @@ def main(domain: str, operation: str, argv: list[str] | None = None) -> int:
             source_candidates_per_rule=args.source_candidates_per_rule,
             gbdt_backend=args.gbdt_backend,
             gbdt_device=args.gbdt_device,
-                **composition,
+            content_rank_scope=args.content_rank_scope,
+            content_fcn_family=args.content_fcn_family,
+            routed_fallback=args.routed_fallback,
+            fcn_model_dir=args.fcn_model_dir,
         )
         payload = {
             "run_id": bundle.manifest.run_id,

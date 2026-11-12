@@ -94,7 +94,9 @@ def test_content_ordering_choices_cover_every_supported_mode(build):
     action = options.get("--content-ordering")
     if action is None:
         pytest.skip("this entrypoint does not order content")
-    supported = {"hand_sum", "learned_rrf"}
+    from recsys_vnpt.orderings import CONTENT_ORDERINGS
+
+    supported = set(CONTENT_ORDERINGS)
     assert set(action.choices) == supported, (
         "CLI --content-ordering choices drifted from the modes pipeline_v2 "
         f"accepts: missing {supported - set(action.choices)}"
@@ -149,20 +151,6 @@ def test_evaluate_baseline_forwards_the_page_flags_it_accepts(monkeypatch):
     assert captured.get("page_dedup") == "greedy_rule_rank"
     assert captured.get("contents_per_rule_max") == 30
     assert captured.get("page_content_budget") == 600
-
-
-def test_gxgp_preset_forwards_profile_composition_and_xgboost_defaults(monkeypatch):
-    captured = _forwarded(
-        monkeypatch,
-        "evaluate_popularity_baseline",
-        ["evaluate-baseline", "--scoring-preset", "GxGp"],
-    )
-    scoring = captured["scoring_config"]
-    assert scoring.preset == "GxGp"
-    assert scoring.content_backends == ("heuristic", "gbdt")
-    assert scoring.rank_scope == "profile"
-    assert captured["rule_gbdt_backend"] == "xgboost"
-    assert captured["content_gbdt_backend"] == "xgboost"
 
 
 # Operational flags: they steer where a run writes or whether it runs at all,
@@ -230,6 +218,10 @@ _LIVE_TEST_FLAGS = {
     "source_candidates_per_rule",
     "gbdt_backend",
     "gbdt_device",
+    "content_rank_scope",
+    "content_fcn_family",
+    "routed_fallback",
+    "fcn_model_dir",
 }
 
 
@@ -263,6 +255,10 @@ _COMPARABILITY_CONFIG = (
     "source_candidates_per_rule",
     "gbdt_backend",
     "gbdt_device",
+    "content_rank_scope",
+    "content_fcn_family",
+    "routed_fallback",
+    "fcn_model_dir",
 )
 
 

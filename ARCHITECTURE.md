@@ -132,7 +132,7 @@ Thứ tự nội dung trong một hàng kết hợp hai nguồn theo thứ hạn
 nguồn này thay cho nguồn kia:
 
 ```
-final = rule_score + rank(incumbent formula) + w · rank(learned scorer)
+final = rank(incumbent formula) + w · rank(learned scorer)
 ```
 
 Công thức incumbent là `normalised popularity + tag affinity + co-watch`; khi
@@ -145,15 +145,25 @@ chéo user×item (tag affinity có idf, affinity theo category và theo family).
 
 Hai điểm thiết kế quan trọng:
 
-- **RRF được tính trong từng khối (profile, rule).** Sắp thứ tự nội dung là bài
-  toán trong phạm vi một hàng; nếu xếp hạng trên toàn bộ profile, phần đuôi của
-  một hàng mạnh sẽ vượt lên phần đầu của một hàng yếu.
+- **RRF mặc định được tính trên toàn bộ candidate của profile.** Tính trong
+  từng khối (profile, rule), nội dung đứng đầu khối nào cũng nhận cùng một mức
+  điểm, dù mức phù hợp với profile khác xa nhau. Thứ hạng trên profile giữ được
+  khoảng cách đó, nên vòng chia slot cạnh tranh của trang so sánh được nội dung
+  giữa các hàng. Chế độ theo khối vẫn chọn được bằng `content_rank_scope = rule`,
+  khi đó `rule_score` được cộng vào làm offset.
 - **Sampler lấy negative từ nhóm phổ biến nhất trong chính rule của positive**
   (`rule_head`), để dữ liệu huấn luyện có cùng phân phối với pool mà mô hình sẽ
   xếp hạng.
 
-Thứ tự rule dùng cùng dạng kết hợp ở cấp hàng. Vì thành phần điểm rule được giữ
-nguyên, các thay đổi phía nội dung không làm thay đổi thứ tự hàng.
+Thứ tự rule dùng cùng dạng kết hợp ở cấp hàng, và được tính độc lập với thứ tự
+nội dung.
+
+**Tổ hợp.** `orderings.py` dựng mọi cách xếp hàng (heuristic, GBDT, head rule của
+`hierarchical_fcn`, heuristic theo nhóm thuê bao) và mọi cách xếp nội dung
+(heuristic, GBDT, FCN, FCN kết hợp RRF, ensemble GBDT + FCN, định tuyến theo
+vocabulary của FCN, heuristic theo nhóm) từ cùng các thành phần. Đánh giá, gate
+và serving gọi chung một hàm `apply_orderings`, nên chọn tổ hợp chỉ là đổi cấu
+hình (`combination`, xem `README.md`).
 
 ## Dựng trang
 
@@ -211,8 +221,9 @@ tràn số ở phép đệ quy hàm mũ; không chèn clamp hay chuẩn hóa L2 
 trình gốc. Checkpoint mới dùng schema phiên bản 3 và bị từ chối khi họ mô hình,
 cấu hình hoặc feature contract không khớp.
 
-Luồng phục vụ hiện dùng độ phổ biến theo rule cộng hai scorer gradient boosting;
-các họ neural ở trên dùng cho nghiên cứu.
+Luồng phục vụ mặc định dùng độ phổ biến theo rule cộng hai scorer gradient
+boosting. `fcn_official` và `hierarchical_fcn` phục vụ được khi tổ hợp cấu hình
+dùng FCN; các họ còn lại dùng cho nghiên cứu.
 
 ## Hệ thống batch production
 
@@ -229,8 +240,8 @@ giống từng byte so với trước khi tách.
 **Bundle chỉ được promote qua gate.** Retrain ghi một bundle bất biến (cả hai
 scorer, SHA-256 của payload, phiên bản thư viện), đánh giá trên cửa sổ test theo
 thời gian bằng đúng code đánh giá đã tạo ra bằng chứng offline, và chỉ di chuyển
-`promoted_model.json` nếu bundle thắng thứ tự heuristic (hand-built) và nằm trong
-ngưỡng cho phép so với bundle đang được promote. Con trỏ trước đó được giữ lại để
+`promoted_model.json` nếu bundle nằm trong ngưỡng cho phép so với bundle đang được
+promote, cả hai chấm theo tổ hợp đang cấu hình. Con trỏ trước đó được giữ lại để
 rollback.
 
 **Các profile độc lập nhau, nên tập profile được chia shard.** Mọi thứ mà một trang

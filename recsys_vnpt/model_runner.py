@@ -68,6 +68,9 @@ class TrainingConfig:
     auxiliary_loss_weight: float = 0.2
     checkpoint_selection: str = "hierarchical"
     amp: bool = False
+    # Length of the cosine learning-rate schedule; None follows ``epochs``. A
+    # fixed-epoch refit sets it to keep the schedule of the run it repeats.
+    lr_schedule_epochs: int | None = None
 
     def __post_init__(self) -> None:
         if self.model_family not in SUPPORTED_MODEL_FAMILIES:
@@ -533,7 +536,7 @@ def train_model(
     model.to(target)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(config.epochs, 1)
+        optimizer, T_max=max(config.lr_schedule_epochs or config.epochs, 1)
     )
     amp_dtype = _autocast_dtype(config.model_family, target)
     scaler = torch.amp.GradScaler(
@@ -557,11 +560,18 @@ def train_model(
     if resume and checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location=target, weights_only=False)
         config_payload = asdict(config)
+        # Checkpoints written before a field existed hashed a payload without it.
+        legacy_payload = (
+            {k: v for k, v in config_payload.items() if k != "lr_schedule_epochs"}
+            if config.lr_schedule_epochs is None
+            else config_payload
+        )
         pre_amp_payload = {
-            key: value for key, value in config_payload.items() if key != "amp"
+            key: value for key, value in legacy_payload.items() if key != "amp"
         }
         compatible_hashes = {
             _config_hash(config),
+            _config_payload_hash(legacy_payload),
             _config_payload_hash(pre_amp_payload),
         }
         if checkpoint.get("model_family") != config.model_family or checkpoint.get("config_hash") not in compatible_hashes:

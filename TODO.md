@@ -8,8 +8,8 @@ dữ liệu upstream, lập lịch và nghiệm thu. Mỗi bước đều trỏ 
 ## 1. Trước staging
 
 - [ ] **Máy chủ.** Chuẩn bị máy chủ retrain và máy chủ inference với Python 3.10+,
-  chạy `pip install -r requirements.txt` trên cả hai; scikit-learn được ghim phiên
-  bản vì model bundle huấn luyện bằng phiên bản khác sẽ bị từ chối. Dự trù khoảng
+  chạy `pip install -r requirements.txt` trên cả hai; scikit-learn và xgboost được
+  ghim phiên bản vì model bundle huấn luyện bằng phiên bản khác sẽ bị từ chối. Dự trù khoảng
   4.5 GB RAM cho mỗi worker inference với quy mô dữ liệu hiện tại; con số này tăng
   theo lượng lịch sử. (§2, §9)
 - [ ] **Bộ nhớ dùng chung.** Tạo bốn thư mục gốc: `incoming_root`, `work_root`,
