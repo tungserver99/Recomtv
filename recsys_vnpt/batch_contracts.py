@@ -24,7 +24,8 @@ from recsys_vnpt.source_manifest import sha256_file, stable_hash
 
 
 READY_FILE = "_READY.json"
-READY_SCHEMA_VERSION = 1
+READY_SCHEMA_VERSION = 2
+LEGACY_READY_SCHEMA_VERSION = 1
 CONFIG_SCHEMA_VERSION = 1
 
 # Stable failure codes and the process exit code each one maps to.
@@ -243,7 +244,7 @@ def load_config(path: str | Path) -> BatchConfig:
 @dataclass(frozen=True)
 class ReadyManifest:
     batch_id: str
-    data_cutoff: datetime
+    batch_started_at: datetime
     created_at: datetime
     files: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
@@ -279,7 +280,8 @@ def load_and_validate_ready(batch_dir: str | Path, batch_id: str) -> ReadyManife
         raw = json.loads(ready_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise BatchError("INPUT_INTEGRITY", f"unreadable {ready_path}: {error}") from error
-    if raw.get("schema_version") != READY_SCHEMA_VERSION:
+    schema_version = raw.get("schema_version")
+    if schema_version not in {LEGACY_READY_SCHEMA_VERSION, READY_SCHEMA_VERSION}:
         raise BatchError("INPUT_INTEGRITY", f"unsupported ready schema: {raw.get('schema_version')}")
     if raw.get("batch_id") != batch_id or batch_dir.name != batch_id:
         raise BatchError(
@@ -334,9 +336,12 @@ def load_and_validate_ready(batch_dir: str | Path, batch_id: str) -> ReadyManife
     missing = [name for name in REQUIRED_SOURCES if name not in present]
     if missing:
         raise BatchError("INPUT_INTEGRITY", f"required sources are missing: {missing}")
+    started_at = raw.get("batch_started_at")
+    if started_at is None and schema_version == LEGACY_READY_SCHEMA_VERSION:
+        started_at = raw.get("data_cutoff")
     return ReadyManifest(
         batch_id=batch_id,
-        data_cutoff=_aware(raw.get("data_cutoff"), "data_cutoff"),
+        batch_started_at=_aware(started_at, "batch_started_at"),
         created_at=_aware(raw.get("created_at"), "created_at"),
         files=tuple(sorted(files, key=lambda row: row["path"])),
     )
@@ -363,16 +368,25 @@ def wait_for_ready(
 
 def write_ready_manifest(
     batch_dir: str | Path,
-    data_cutoff: datetime,
     batch_id: str | None = None,
+    batch_started_at: datetime | None = None,
 ) -> Path:
     """Hash every file of a finished batch and write ``_READY.json`` last.
 
     The reference implementation of the upstream side of the protocol.
     """
     batch_dir = Path(batch_dir)
-    if data_cutoff.tzinfo is None:
-        raise ValueError("data_cutoff must carry a timezone")
+    if batch_started_at is not None and (
+        batch_started_at.tzinfo is None or batch_started_at.utcoffset() is None
+    ):
+        raise ValueError("batch_started_at must carry a timezone")
+    existing = batch_dir / READY_FILE
+    if existing.is_file():
+        manifest = load_and_validate_ready(batch_dir, batch_id or batch_dir.name)
+        if batch_started_at is not None and manifest.batch_started_at != batch_started_at:
+            raise BatchError("INPUT_INTEGRITY", "batch_started_at conflicts with the committed READY manifest")
+        return existing
+    batch_started_at = batch_started_at or datetime.now(timezone.utc)
     files = [
         {
             "path": relative,
@@ -384,7 +398,7 @@ def write_ready_manifest(
     payload = {
         "schema_version": READY_SCHEMA_VERSION,
         "batch_id": batch_id or batch_dir.name,
-        "data_cutoff": data_cutoff.isoformat(),
+        "batch_started_at": batch_started_at.isoformat(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "files": files,
     }

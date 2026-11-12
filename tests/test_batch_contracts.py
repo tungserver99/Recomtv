@@ -15,10 +15,10 @@ from recsys_vnpt.batch_contracts import (
 )
 from recsys_vnpt.batch_state import BatchLock, BatchStatus
 
-CUTOFF = datetime(2025, 3, 1, tzinfo=timezone.utc)
+BATCH_STARTED = datetime(2025, 3, 1, 8, 30, tzinfo=timezone.utc)
 
 
-def _batch(tmp_path, name="b1"):
+def _batch(tmp_path, name="b1", batch_started_at=BATCH_STARTED):
     batch = tmp_path / name
     for relative in (
         "duration/part.csv",
@@ -30,7 +30,7 @@ def _batch(tmp_path, name="b1"):
         path = batch / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(relative, encoding="utf-8")
-    write_ready_manifest(batch, CUTOFF)
+    write_ready_manifest(batch, batch_started_at=batch_started_at)
     return batch
 
 
@@ -43,7 +43,7 @@ def _rewrite_ready(batch, mutate):
 def test_ready_manifest_round_trips_with_a_content_fingerprint(tmp_path):
     first = load_and_validate_ready(_batch(tmp_path / "x", "b1"), "b1")
     second = load_and_validate_ready(_batch(tmp_path / "y", "b2"), "b2")
-    assert first.data_cutoff == CUTOFF
+    assert first.batch_started_at == BATCH_STARTED
     assert len(first.files) == 5
     # Same bytes under another batch id is the same input.
     assert first.fingerprint == second.fingerprint
@@ -58,7 +58,7 @@ def test_ready_manifest_round_trips_with_a_content_fingerprint(tmp_path):
         (lambda b: _rewrite_ready(b, lambda r: r["files"][0].update(path="../escape")), "unsafe"),
         (lambda b: _rewrite_ready(b, lambda r: r["files"][0].update(path="/abs")), "unsafe"),
         (lambda b: _rewrite_ready(b, lambda r: r["files"].append(dict(r["files"][0]))), "duplicate"),
-        (lambda b: _rewrite_ready(b, lambda r: r.update(data_cutoff="2025-03-01T00:00:00")), "timezone"),
+        (lambda b: _rewrite_ready(b, lambda r: r.update(batch_started_at="2025-03-01T00:00:00")), "timezone"),
         (lambda b: _rewrite_ready(b, lambda r: r.update(batch_id="other")), "batch id"),
         (
             lambda b: _rewrite_ready(
@@ -83,9 +83,43 @@ def test_ready_manifest_rejects_a_symlink_out_of_the_batch(tmp_path):
     outside = tmp_path / "outside.csv"
     outside.write_text("secret")
     (batch / "duration" / "link.csv").symlink_to(outside)
-    write_ready_manifest(batch, CUTOFF)
-    with pytest.raises(BatchError, match="escapes"):
-        load_and_validate_ready(batch, "b1")
+    with pytest.raises(BatchError, match="not in the manifest"):
+        write_ready_manifest(batch, batch_started_at=BATCH_STARTED)
+
+
+def test_ready_manifest_uses_one_stable_start_and_separate_manifest_completion_time(tmp_path):
+    batch = _batch(tmp_path)
+    first = load_and_validate_ready(batch, "b1")
+    ready_before = (batch / "_READY.json").read_bytes()
+
+    write_ready_manifest(batch)
+
+    second = load_and_validate_ready(batch, "b1")
+    assert second.batch_started_at == BATCH_STARTED
+    assert second.created_at == first.created_at
+    assert (batch / "_READY.json").read_bytes() == ready_before
+    with pytest.raises(BatchError, match="conflicts"):
+        write_ready_manifest(batch, batch_started_at=datetime(2025, 3, 4, 8, 30, tzinfo=timezone.utc))
+
+
+def test_ready_manifest_generates_timezone_aware_start_when_not_supplied(tmp_path):
+    batch = _batch(tmp_path, "auto", batch_started_at=None)
+    manifest = load_and_validate_ready(batch, "auto")
+    assert manifest.batch_started_at.tzinfo is not None
+    assert manifest.batch_started_at.utcoffset() is not None
+
+
+def test_legacy_ready_manifest_maps_data_cutoff_to_batch_start_without_rewriting(tmp_path):
+    batch = _batch(tmp_path)
+    raw = json.loads((batch / "_READY.json").read_text())
+    raw["schema_version"] = 1
+    raw["data_cutoff"] = raw.pop("batch_started_at")
+    (batch / "_READY.json").write_text(json.dumps(raw))
+
+    manifest = load_and_validate_ready(batch, "b1")
+
+    assert manifest.batch_started_at == BATCH_STARTED
+    assert json.loads((batch / "_READY.json").read_text())["schema_version"] == 1
 
 
 def test_waiting_for_input_times_out_without_sleeping_for_real(tmp_path):

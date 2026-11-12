@@ -125,7 +125,7 @@ def write_smoke_batch(incoming_root: str | Path, batch_id: str, **options) -> Pa
     """A complete committed batch: sources first, ``_READY.json`` last."""
     batch_dir = Path(incoming_root) / batch_id
     cutoff = write_smoke_sources(batch_dir, **options)
-    write_ready_manifest(batch_dir, cutoff, batch_id)
+    write_ready_manifest(batch_dir, batch_id=batch_id)
     return batch_dir
 
 

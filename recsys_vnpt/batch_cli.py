@@ -4,7 +4,7 @@
     python -m recsys_vnpt.batch_cli run-inference    --config CFG --batch-id ID
     python -m recsys_vnpt.batch_cli run-retrain      --config CFG --batch-id ID
     python -m recsys_vnpt.batch_cli qualify-hardware --config CFG --batch-id ID
-    python -m recsys_vnpt.batch_cli make-ready       --batch-dir DIR --data-cutoff ISO
+    python -m recsys_vnpt.batch_cli make-ready       --batch-dir DIR
 
 Success prints one JSON document on stdout and exits 0. A failure prints
 ``{"error_code": ..., "message": ...}`` on stderr and exits with the code listed
@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from recsys_vnpt.batch_contracts import BatchError, load_and_validate_ready, load_config, write_ready_manifest
@@ -32,7 +31,7 @@ def _preflight(config, batch_id: str) -> dict:
     return {
         "batch_id": batch_id,
         "input_fingerprint": manifest.fingerprint,
-        "data_cutoff": manifest.data_cutoff.isoformat(),
+        "batch_started_at": manifest.batch_started_at.isoformat(),
         "files": len(manifest.files),
         **bundle,
     }
@@ -47,17 +46,18 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--batch-id", required=True)
     ready = commands.add_parser("make-ready", help="hash a finished input batch and write _READY.json")
     ready.add_argument("--batch-dir", required=True)
-    ready.add_argument("--data-cutoff", required=True, help="ISO-8601 with offset, e.g. 2026-09-22T23:59:59+07:00")
     args = parser.parse_args(argv)
 
     try:
         if args.command == "make-ready":
-            cutoff = datetime.fromisoformat(args.data_cutoff)
-            if cutoff.tzinfo is None:
-                raise BatchError("INPUT_INTEGRITY", "--data-cutoff needs a timezone offset")
-            path = write_ready_manifest(args.batch_dir, cutoff)
+            path = write_ready_manifest(args.batch_dir)
             manifest = load_and_validate_ready(Path(args.batch_dir), Path(args.batch_dir).name)
-            result = {"ready": str(path), "input_fingerprint": manifest.fingerprint, "files": len(manifest.files)}
+            result = {
+                "ready": str(path),
+                "batch_started_at": manifest.batch_started_at.isoformat(),
+                "input_fingerprint": manifest.fingerprint,
+                "files": len(manifest.files),
+            }
         else:
             from recsys_vnpt import batch_runner
 
