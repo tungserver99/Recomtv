@@ -135,7 +135,7 @@ luồng neural. Content scorer đọc `contents.parquet` (bản mới nhất), x
 
 - `birthday` dạng `YYYYMMDD` → `birth_year` nếu năm nằm trong [1900, năm tham
   chiếu], `age` = năm tham chiếu − `birth_year`; sai định dạng thì để trống và ghi
-  vào `users_quarantine.parquet`. Năm tham chiếu là năm của `data_cutoff` trong
+  vào `users_quarantine.parquet`. Năm tham chiếu là năm của `batch_started_at` trong
   batch, hoặc 2025 khi nghiên cứu.
 - `sex` chỉ nhận 0 hoặc 1, giá trị khác để trống.
 - `username` được chuẩn hóa; dòng thiếu username bị loại; trùng thì giữ dòng cuối.
@@ -151,7 +151,7 @@ Thư mục canonical chứa `users.parquet`, `interactions.parquet`,
 
 Cache fingerprint là hash của manifest nguồn (đường dẫn, kích thước, hash từng
 file) cộng các tùy chọn (domain, giới hạn số dòng, `include_behavior`,
-`target_version`, `session_gap_minutes`) và phiên bản schema 10. Fingerprint không
+`target_version`, `session_gap_minutes`, yêu cầu timestamp chính xác) và phiên bản schema 11. Fingerprint không
 đổi thì artifact được tái sử dụng. Trong batch, artifact nằm ở
 `work_root/artifacts/<input_fingerprint>/`, nên inference và retrain trên cùng một
 đầu vào chỉ prepare một lần.
@@ -708,7 +708,7 @@ Các chính sách khác trong `PAGE_DEDUP_POLICIES`, giữ lại để so sánh:
 |---|---|
 | `scorers.joblib` | hai model: các head, `rule_index` (rule scorer) hoặc `level_maps` (content scorer), và metrics khi fit |
 | `fcn/<family>/` | `best_model_v2.pth` và `feature_contract_v2.json` của từng FCN mà tổ hợp cần, nếu có |
-| `bundle.json` | `schema_version` 1, `bundle_id` = `<thời điểm UTC>_<12 ký tự đầu bundle_sha256>`, `model_sha256` (của `scorers.joblib`), `bundle_sha256` (của mọi mô hình), `fcn` (SHA-256 từng file FCN), phiên bản `python`/`scikit-learn`/`numpy`/`pandas`/`xgboost`/`torch`, metrics của hai scorer, `ordering`, `batch_id`, `input_fingerprint`, `data_cutoff`, `serving_cutoff`, `code_version` |
+| `bundle.json` | `schema_version` 1, `bundle_id` = `<thời điểm UTC>_<12 ký tự đầu bundle_sha256>`, `model_sha256` (của `scorers.joblib`), `bundle_sha256` (của mọi mô hình), `fcn` (SHA-256 từng file FCN), phiên bản `python`/`scikit-learn`/`numpy`/`pandas`/`xgboost`/`torch`, metrics của hai scorer, `ordering`, `batch_id`, `input_fingerprint`, `batch_started_at`, `serving_cutoff`, `code_version` |
 
 **Nạp bundle**: phải khớp `schema_version`, SHA-256 của `scorers.joblib` và của
 từng file FCN mà tổ hợp cần, phiên bản scikit-learn đang cài, và phiên bản xgboost

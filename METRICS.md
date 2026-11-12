@@ -69,9 +69,8 @@ engagement tương lai bị bỏ lỡ trước khi xếp hạng.
 ## Lệnh pipeline
 
 ```powershell
-# Cài dependency cơ bản trước; ghi đè bản CUDA phải làm tường minh.
+# Cài toàn bộ dependency (bao gồm PyTorch CUDA 12.8) từ một file.
 python -m pip install -r requirements.txt
-python -m pip install --force-reinstall --no-deps -r requirements-cuda.txt
 
 # Dữ liệu thô -> canonical. Chỉ thêm giới hạn khi diễn tập có chủ đích.
 python -m recsys_vnpt.pipeline_cli prepare --domain all --max-interaction-rows 500000 --skip-behavior --target-version engagement_v1 --session-gap-minutes 30

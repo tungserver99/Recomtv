@@ -41,6 +41,7 @@ from recsys_vnpt.batch_contracts import (
     BatchConfig,
     BatchError,
     ReadyManifest,
+    batch_started_at_from_metadata,
     load_and_validate_ready,
     wait_for_ready,
 )
@@ -56,6 +57,11 @@ from recsys_vnpt.export import (
 from recsys_vnpt.gbdt import serve_on
 from recsys_vnpt.output_validation import validate_client_output
 from recsys_vnpt.paths import data_artifact_path
+from recsys_vnpt.prepared_dataset import (
+    load_prepared_dataset,
+    prepared_dataset_paths,
+    write_prepared_dataset_manifest,
+)
 from recsys_vnpt.runtime import atomic_write_text
 from recsys_vnpt.scorer_bundle import (
     BundleError,
@@ -92,6 +98,7 @@ HARD_OUTPUT_COUNTS = (
 # Which failure code an unexpected exception maps to, by the phase it hit.
 PHASE_ERROR_CODES = {
     "PREPARING_DATA": "SCHEMA_DRIFT",
+    "LOADING_PREPARED_DATA": "PREPARED_DATA_UNAVAILABLE",
     "LOADING_MODEL": "MODEL_UNAVAILABLE",
     "RUNNING_SHARDS": "INFERENCE_FAILED",
     "MEASURING": "INFERENCE_FAILED",
@@ -168,8 +175,17 @@ def _waiting_lock(locks: Path, name: str, timeout: float, poll: float) -> Iterat
 # --- input and data preparation ------------------------------------------------
 
 
-def _validate_input(config: BatchConfig, batch_id: str) -> ReadyManifest:
-    manifest = load_and_validate_ready(config.root("incoming_root") / batch_id, batch_id)
+def _validate_input(
+    config: BatchConfig,
+    batch_id: str,
+    *,
+    verify_checksums: bool = True,
+) -> ReadyManifest:
+    manifest = load_and_validate_ready(
+        config.root("incoming_root") / batch_id,
+        batch_id,
+        verify_checksums=verify_checksums,
+    )
     work = config.root("work_root")
     work.mkdir(parents=True, exist_ok=True)
     free = shutil.disk_usage(work).free
@@ -178,28 +194,57 @@ def _validate_input(config: BatchConfig, batch_id: str) -> ReadyManifest:
     return manifest
 
 
-def _prepare(config: BatchConfig, manifest: ReadyManifest, temporal: bool) -> Path:
-    """Canonical (and for retraining, temporal) artifacts for this input,
-    cached by input fingerprint under the work root."""
+def _prepare(
+    config: BatchConfig,
+    manifest: ReadyManifest,
+    temporal: bool = True,
+    progress=None,
+    data_root: Path | None = None,
+    timings: dict[str, float] | None = None,
+) -> Path:
+    """Build canonical and optional temporal artifacts for an explicit prepare job."""
     from recsys_vnpt.pipeline_v2 import build_temporal_project, prepare_canonical_project
 
-    data_root = config.root("work_root") / "artifacts" / manifest.fingerprint[:24]
+    data_root = data_root or prepared_dataset_paths(config, manifest).artifact_root
     source = config.root("incoming_root") / manifest.batch_id
-    with _waiting_lock(
-        config.root("work_root") / "locks",
-        f"prepare-{manifest.fingerprint[:24]}",
-        config.input_wait_seconds,
-        config.poll_seconds,
-    ), _roots(source, data_root):
+    with _roots(source, data_root):
         try:
+            if progress:
+                progress("canonical_prepare", status="started", temporal=temporal)
+            step_started = time.perf_counter()
             prepare_canonical_project(
                 PROJECT_ROOT,
                 config.domain,
                 include_behavior=config.include_behavior,
-                user_reference_date=pd.Timestamp(manifest.data_cutoff.date()),
+                user_reference_date=pd.Timestamp(manifest.batch_started_at.date()),
+                require_precise_create_date=temporal,
+                progress_callback=progress,
             )
+            if timings is not None:
+                timings["canonical_seconds"] = time.perf_counter() - step_started
+            if progress:
+                progress("prepare_step_timing", step="canonical", seconds=time.perf_counter() - step_started)
+            if progress:
+                progress("canonical_prepare", status="completed", temporal=temporal)
             if temporal:
-                build_temporal_project(PROJECT_ROOT, config.domain, window_mode="relative")
+                if progress:
+                    progress("temporal_build", status="started")
+                step_started = time.perf_counter()
+                build_temporal_project(
+                    PROJECT_ROOT,
+                    config.domain,
+                    window_mode="relative",
+                    time_train=config.time_train,
+                    time_valid=config.time_valid,
+                    time_test=config.time_test,
+                    progress_callback=progress,
+                )
+                if timings is not None:
+                    timings["temporal_seconds"] = time.perf_counter() - step_started
+                if progress:
+                    progress("prepare_step_timing", step="temporal", seconds=time.perf_counter() - step_started)
+                if progress:
+                    progress("temporal_build", status="completed")
         except MemoryError as error:
             raise BatchError("CAPACITY", "out of memory while preparing data") from error
         except BatchError:
@@ -207,6 +252,117 @@ def _prepare(config: BatchConfig, manifest: ReadyManifest, temporal: bool) -> Pa
         except Exception as error:
             raise BatchError("SCHEMA_DRIFT", f"{type(error).__name__}: {error}") from error
     return data_root
+
+
+def run_prepare_data_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
+    """Validate input and materialize the reusable canonical/temporal dataset."""
+    def body(work: Path, status: BatchStatus) -> dict[str, Any]:
+        wait_for_ready(config.root("incoming_root") / batch_id, config.input_wait_seconds, config.poll_seconds)
+        status.transition("VALIDATING_INPUT")
+        validation_started = time.perf_counter()
+        manifest = _validate_input(config, batch_id, verify_checksums=False)
+        validation_seconds = time.perf_counter() - validation_started
+        paths = prepared_dataset_paths(config, manifest)
+        with _waiting_lock(
+            config.root("work_root") / "locks",
+            f"prepare-{paths.artifact_key}",
+            config.input_wait_seconds,
+            config.poll_seconds,
+        ):
+            try:
+                dataset = load_prepared_dataset(config, manifest)
+            except BatchError as error:
+                if error.code != "PREPARED_DATA_UNAVAILABLE":
+                    raise
+                status.log("prepared_dataset_cache", status="miss", reason=error.message)
+            else:
+                status.transition(
+                    "PREPARING_DATA",
+                    input_fingerprint=manifest.fingerprint,
+                    prepared_dataset_key=paths.artifact_key,
+                    cache="hit",
+                )
+                status.transition("PREPARED", prepared_dataset=str(dataset.manifest_path), reused=True)
+                return {
+                    "status": "prepared",
+                    "reused": True,
+                    "batch_id": batch_id,
+                    "input_fingerprint": manifest.fingerprint,
+                    "preparation_config_hash": paths.config_hash,
+                    "prepared_dataset": str(dataset.manifest_path),
+                    "artifact_root": str(dataset.artifact_root),
+                    "validation_seconds": validation_seconds,
+                    "prepare_seconds": 0.0,
+                }
+
+            full_validation_started = time.perf_counter()
+            verified_manifest = _validate_input(config, batch_id, verify_checksums=True)
+            if verified_manifest.fingerprint != manifest.fingerprint:
+                raise BatchError(
+                    "INPUT_INTEGRITY",
+                    "input manifest changed while prepare-data was resolving its cache; retry the job",
+                )
+            manifest = verified_manifest
+            validation_seconds = time.perf_counter() - validation_started
+            status.log(
+                "input_validation_timing",
+                quick_seconds=full_validation_started - validation_started,
+                checksum_seconds=time.perf_counter() - full_validation_started,
+            )
+
+            status.transition(
+                "PREPARING_DATA",
+                input_fingerprint=manifest.fingerprint,
+                prepared_dataset_key=paths.artifact_key,
+                cache="miss",
+            )
+            write_prepared_dataset_manifest(config, manifest, status="PREPARING")
+            prepare_started = time.perf_counter()
+            timings: dict[str, float] = {"validation_seconds": validation_seconds}
+            try:
+                artifact_root = _prepare(
+                    config,
+                    manifest,
+                    temporal=True,
+                    progress=status.log,
+                    data_root=paths.artifact_root,
+                    timings=timings,
+                )
+                timings["prepare_seconds"] = time.perf_counter() - prepare_started
+                manifest_path = write_prepared_dataset_manifest(
+                    config, manifest, status="READY", timings=timings
+                )
+            except Exception as error:
+                timings["prepare_seconds"] = time.perf_counter() - prepare_started
+                try:
+                    write_prepared_dataset_manifest(
+                        config,
+                        manifest,
+                        status="FAILED",
+                        timings=timings,
+                        error=f"{type(error).__name__}: {error}",
+                    )
+                except Exception:
+                    pass
+                if isinstance(error, BatchError):
+                    raise
+                if isinstance(error, MemoryError):
+                    raise BatchError("CAPACITY", "out of memory while preparing data") from error
+                raise BatchError("SCHEMA_DRIFT", f"{type(error).__name__}: {error}") from error
+
+            status.transition("PREPARED", prepared_dataset=str(manifest_path), reused=False)
+            return {
+                "status": "prepared",
+                "reused": False,
+                "batch_id": batch_id,
+                "input_fingerprint": manifest.fingerprint,
+                "preparation_config_hash": paths.config_hash,
+                "prepared_dataset": str(manifest_path),
+                "artifact_root": str(artifact_root),
+                **timings,
+            }
+
+    return _run(config, batch_id, "prepare", body, allow_already_done=False)
 
 
 def sample_profiles(profile_ids: list[str], limit: int) -> list[str]:
@@ -599,14 +755,21 @@ def aggregate_validation(shards: list[dict[str, Any]]) -> dict[str, Any]:
 # --- runs ----------------------------------------------------------------------------
 
 
-def _run(config: BatchConfig, batch_id: str, kind: str, body) -> dict[str, Any]:
+def _run(
+    config: BatchConfig,
+    batch_id: str,
+    kind: str,
+    body,
+    *,
+    allow_already_done: bool = True,
+) -> dict[str, Any]:
     """Lock, track status, and turn any failure into a coded BatchError."""
     _check_batch_id(batch_id)
     work = config.root("work_root") / "batches" / batch_id / kind
     status = BatchStatus(work / "status.json", batch_id, kind)
     with BatchLock(config.root("work_root") / "locks", f"{kind}-{batch_id}"):
         previous = status.read()
-        if previous and previous["phase"] == status.phases[-1]:
+        if allow_already_done and previous and previous["phase"] == status.phases[-1]:
             status.log("already_done", phase=previous["phase"])
             return {"status": "already_done", **previous["details"]}
         status.begin()
@@ -631,7 +794,7 @@ def run_inference_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
         delivery = config.root("delivery_root")
         wait_for_ready(config.root("incoming_root") / batch_id, config.input_wait_seconds, config.poll_seconds)
         status.transition("VALIDATING_INPUT")
-        manifest = _validate_input(config, batch_id)
+        manifest = _validate_input(config, batch_id, verify_checksums=False)
         try:
             current = read_current_delivery(delivery)
         except (OSError, ValueError, KeyError) as error:
@@ -640,18 +803,25 @@ def run_inference_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
             # Committed by an earlier attempt that died before recording it.
             status.transition("PUBLISHED", generation=current["generation"])
             return {"status": "already_published", "generation": current["generation"]}
-        if current and datetime.fromisoformat(current["data_cutoff"]) >= manifest.data_cutoff:
+        current_batch_started_at = batch_started_at_from_metadata(current) if current else None
+        if current_batch_started_at and current_batch_started_at >= manifest.batch_started_at:
             raise BatchError(
                 "INPUT_INTEGRITY",
-                f"data_cutoff {manifest.data_cutoff.isoformat()} does not advance past the "
-                f"published {current['data_cutoff']} (batch {current['batch_id']})",
+                f"batch_started_at {manifest.batch_started_at.isoformat()} does not advance past the "
+                f"published {current_batch_started_at.isoformat()} (batch {current['batch_id']})",
             )
         timings["validate_seconds"] = time.perf_counter() - started
 
-        status.transition("PREPARING_DATA", input_fingerprint=manifest.fingerprint)
+        status.transition("LOADING_PREPARED_DATA", input_fingerprint=manifest.fingerprint)
         stage_started = time.perf_counter()
-        data_root = _prepare(config, manifest, temporal=False)
-        timings["prepare_seconds"] = time.perf_counter() - stage_started
+        prepared = load_prepared_dataset(config, manifest)
+        data_root = prepared.artifact_root
+        timings["prepared_data_validation_seconds"] = time.perf_counter() - stage_started
+        status.log(
+            "prepared_dataset_loaded",
+            manifest=str(prepared.manifest_path),
+            artifact_key=prepared.manifest["artifact_key"],
+        )
 
         with _roots(config.root("incoming_root") / batch_id, data_root):
             status.transition("LOADING_MODEL")
@@ -679,7 +849,7 @@ def run_inference_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
         generation = f"{batch_id}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
         stage = delivery / "generations" / f".{generation}.stage"
         try:
-            names = production_output_names(config.domain, manifest.data_cutoff.strftime("%Y%m%d"))
+            names = production_output_names(config.domain, manifest.batch_started_at.strftime("%Y%m%d"))
             merge_shards(
                 [work / "shards" / f"shard_{index:05d}" for index in range(config.num_shards)],
                 stage,
@@ -703,7 +873,7 @@ def run_inference_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
                     "batch_id": batch_id,
                     "domain": config.domain,
                     "input_fingerprint": manifest.fingerprint,
-                    "data_cutoff": manifest.data_cutoff.isoformat(),
+                    "batch_started_at": manifest.batch_started_at.isoformat(),
                     "serving_cutoff": shards[0]["serving_cutoff"] if shards else None,
                     "profiles": len(profile_ids),
                     "page_fingerprint": config.page_fingerprint(),
@@ -870,9 +1040,15 @@ def run_retrain_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
         started = time.perf_counter()
         wait_for_ready(config.root("incoming_root") / batch_id, config.input_wait_seconds, config.poll_seconds)
         status.transition("VALIDATING_INPUT")
-        manifest = _validate_input(config, batch_id)
-        status.transition("PREPARING_DATA", input_fingerprint=manifest.fingerprint)
-        data_root = _prepare(config, manifest, temporal=True)
+        manifest = _validate_input(config, batch_id, verify_checksums=False)
+        status.transition("LOADING_PREPARED_DATA", input_fingerprint=manifest.fingerprint)
+        prepared = load_prepared_dataset(config, manifest)
+        data_root = prepared.artifact_root
+        status.log(
+            "prepared_dataset_loaded",
+            manifest=str(prepared.manifest_path),
+            artifact_key=prepared.manifest["artifact_key"],
+        )
 
         with _roots(config.root("incoming_root") / batch_id, data_root):
             status.transition("TRAINING")
@@ -886,13 +1062,17 @@ def run_retrain_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
                 errors="coerce",
             ).max()
             try:
+                status.log("scorer_training", scorer="rule", status="started")
                 rule_model = train_rule_scorer(
                     canonical, loader, backend=config.gbdt_backend, device=config.gbdt_device
                 )
+                status.log("scorer_training", scorer="rule", status="completed")
+                status.log("scorer_training", scorer="content", status="started")
                 content_model = train_content_scorer(
                     canonical, pd.Timestamp(cutoff), loader,
                     backend=config.gbdt_backend, device=config.gbdt_device,
                 )
+                status.log("scorer_training", scorer="content", status="completed")
                 fcn_dirs = {}
                 for family in config.ordering.fcn_families:
                     status.log("fcn_training", family=family, epochs=config.fcn_epochs)
@@ -901,6 +1081,7 @@ def run_retrain_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
                         canonical, config.domain, family, fcn_dirs[family],
                         epochs=config.fcn_epochs, schedule_epochs=config.fcn_schedule_epochs,
                     )
+                    status.log("fcn_training", family=family, status="completed")
             except Exception as error:
                 raise BatchError("RETRAIN_FAILED", f"{type(error).__name__}: {error}") from error
             bundle = save_bundle(
@@ -910,7 +1091,7 @@ def run_retrain_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
                 {
                     "batch_id": batch_id,
                     "input_fingerprint": manifest.fingerprint,
-                    "data_cutoff": manifest.data_cutoff.isoformat(),
+                    "batch_started_at": manifest.batch_started_at.isoformat(),
                     "serving_cutoff": str(cutoff),
                     "code_version": code_version(),
                     "ordering": asdict(config.ordering),
@@ -995,11 +1176,16 @@ def qualify_hardware(config: BatchConfig, batch_id: str) -> dict[str, Any]:
     def body(work: Path, status: BatchStatus) -> dict[str, Any]:
         wait_for_ready(config.root("incoming_root") / batch_id, config.input_wait_seconds, config.poll_seconds)
         status.transition("VALIDATING_INPUT")
-        manifest = _validate_input(config, batch_id)
-        status.transition("PREPARING_DATA", input_fingerprint=manifest.fingerprint)
-        prepare_started = time.perf_counter()
-        data_root = _prepare(config, manifest, temporal=False)
-        prepare_seconds = time.perf_counter() - prepare_started
+        manifest = _validate_input(config, batch_id, verify_checksums=False)
+        status.transition("LOADING_PREPARED_DATA", input_fingerprint=manifest.fingerprint)
+        prepared = load_prepared_dataset(config, manifest)
+        data_root = prepared.artifact_root
+        prepare_seconds = 0.0
+        status.log(
+            "prepared_dataset_loaded",
+            manifest=str(prepared.manifest_path),
+            artifact_key=prepared.manifest["artifact_key"],
+        )
         results = []
         with _roots(config.root("incoming_root") / batch_id, data_root):
             status.transition("LOADING_MODEL")
@@ -1010,7 +1196,7 @@ def qualify_hardware(config: BatchConfig, batch_id: str) -> dict[str, Any]:
                 key=lambda pid: hashlib.sha256(pid.encode("utf-8")).digest(),
             )
             status.transition("MEASURING", available_profiles=len(ordered))
-            names = production_output_names(config.domain, manifest.data_cutoff.strftime("%Y%m%d"))
+            names = production_output_names(config.domain, manifest.batch_started_at.strftime("%Y%m%d"))
             identity = {"qualification": True, "page_fingerprint": config.page_fingerprint()}
             for workload in sorted(config.qualification_workloads):
                 if workload > len(ordered):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 from pathlib import Path
@@ -62,34 +62,41 @@ def _day_end(value: str) -> pd.Timestamp:
 
 def derive_relative_temporal_windows(
     max_event_date: pd.Timestamp,
-    window_days: int = 10,
+    time_train: int = 24,
+    time_valid: int = 24,
+    time_test: int = 24,
 ) -> tuple[TemporalWindow, ...]:
-    """Five rolling windows (3 train, validation, test) ending at the data's
-    last event day, for deployments whose data is newer than the pinned
-    2024-12/2025-02 defaults."""
-    if window_days < 1:
-        raise ValueError("window_days must be positive")
-    end = pd.Timestamp(max_event_date).normalize()
-    windows = []
+    """Create adjacent hourly windows ending at the exact latest event time."""
+    for name, value in (("time_train", time_train), ("time_valid", time_valid), ("time_test", time_test)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    end = pd.Timestamp(max_event_date)
+    if pd.isna(end):
+        raise ValueError("max_event_date must be a valid timestamp")
+    durations = [time_train, time_train, time_train, time_valid, time_test]
+    boundaries = [end - pd.Timedelta(hours=sum(durations))]
+    for hours in durations:
+        boundaries.append(boundaries[-1] + pd.Timedelta(hours=hours))
+    windows: list[TemporalWindow] = []
     names = ("train_1", "train_2", "train_3", "validation", "test")
     splits = ("train", "train", "train", "validation", "test")
     for index, (name, split) in enumerate(zip(names, splits)):
-        offset = (len(names) - 1 - index) * window_days
-        label_end = end - pd.Timedelta(days=offset)
-        label_start = (label_end - pd.Timedelta(days=window_days - 1)).normalize()
+        label_start = boundaries[index]
+        next_start = boundaries[index + 1]
+        label_end = end if index == len(names) - 1 else next_start - pd.Timedelta(1, unit="ns")
         windows.append(
             TemporalWindow(
                 name,
                 label_start - pd.Timedelta(1, unit="ns"),
                 label_start,
-                label_end.normalize() + pd.offsets.Day(1) - pd.Timedelta(1, unit="ns"),
+                label_end,
                 split,
             )
         )
     return tuple(windows)
 
 
-def write_temporal_windows(directory, windows: tuple[TemporalWindow, ...]) -> None:
+def write_temporal_windows(directory, windows: tuple[TemporalWindow, ...], time_config: dict | None = None) -> None:
     import json
     from pathlib import Path
 
@@ -104,9 +111,8 @@ def write_temporal_windows(directory, windows: tuple[TemporalWindow, ...]) -> No
         for window in windows
     ]
     Path(directory).mkdir(parents=True, exist_ok=True)
-    (Path(directory) / "windows.json").write_text(
-        json.dumps(payload, indent=2), encoding="utf-8"
-    )
+    envelope = {"schema_version": 2, "time_config": time_config, "windows": payload}
+    (Path(directory) / "windows.json").write_text(json.dumps(envelope, indent=2), encoding="utf-8")
 
 
 def load_temporal_windows(directory) -> tuple[TemporalWindow, ...]:
@@ -121,6 +127,7 @@ def load_temporal_windows(directory) -> tuple[TemporalWindow, ...]:
     if not path.exists():
         return DEFAULT_TEMPORAL_WINDOWS
     payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = payload.get("windows", payload) if isinstance(payload, dict) else payload
     return tuple(
         TemporalWindow(
             str(row["name"]),
@@ -129,8 +136,26 @@ def load_temporal_windows(directory) -> tuple[TemporalWindow, ...]:
             pd.Timestamp(row["label_end"]),
             str(row["split"]),
         )
-        for row in payload
+        for row in rows
     )
+
+
+def temporal_window_fingerprint(windows, window_mode, time_train=24, time_valid=24, time_test=24) -> str:
+    payload = {
+        "window_mode": window_mode,
+        "time_train": time_train,
+        "time_valid": time_valid,
+        "time_test": time_test,
+        "windows": [asdict(window) for window in windows],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def validate_window_positives(labeled_windows: dict[str, pd.DataFrame]) -> None:
+    for name, frame in labeled_windows.items():
+        positives = int(pd.to_numeric(frame.get("label", pd.Series(dtype=float)), errors="coerce").fillna(0).eq(1).sum())
+        if positives == 0:
+            raise ValueError(f"window {name} has no positive samples")
 
 
 DEFAULT_TEMPORAL_WINDOWS = (

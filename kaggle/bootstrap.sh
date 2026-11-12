@@ -50,11 +50,20 @@ tar --exclude='./data' \
   --exclude='*/__pycache__' \
   -cf - -C "$source_dir" . | tar -xf - -C "$work_dir/repo"
 
+if [[ ! -f "$work_dir/repo/requirements.txt" ]]; then
+  echo "source bundle must contain requirements.txt" >&2
+  exit 2
+fi
+# Kaggle images ship a CUDA-compatible Torch build. Keep shared dependencies
+# while leaving the preinstalled Torch version untouched.
+kaggle_requirements="$work_dir/requirements-kaggle.txt"
+grep -Ev '^(--extra-index-url|torch==)' "$work_dir/repo/requirements.txt" \
+  > "$kaggle_requirements"
 if [[ -n "${RECSYS_KAGGLE_WHEELHOUSE:-}" ]]; then
   python -m pip install --no-index --find-links "$RECSYS_KAGGLE_WHEELHOUSE" \
-    -r "$work_dir/repo/requirements-kaggle.txt"
+    -r "$kaggle_requirements"
 else
-  python -m pip install -r "$work_dir/repo/requirements-kaggle.txt"
+  python -m pip install -r "$kaggle_requirements"
 fi
 
 cd "$work_dir/repo"

@@ -23,8 +23,8 @@ dữ liệu upstream, lập lịch và nghiệm thu. Mỗi bước đều trỏ 
 - [ ] **Bên cung cấp dữ liệu upstream.** Với mỗi lượt chạy, sao chép một snapshot
   đầy đủ của dữ liệu thô vào `incoming_root/<batch_id>/` và ghi `_READY.json` sau
   cùng, liệt kê mọi file kèm kích thước và SHA-256 (`batch_cli make-ready` là bản
-  triển khai tham chiếu). Snapshot nội dung phải có các cột liệt kê ở §4, và
-  `data_cutoff` phải tăng dần qua từng batch. (§4)
+  triển khai tham chiếu). Snapshot nội dung phải có các cột liệt kê ở §4; batch
+  được sắp thứ tự bằng `batch_started_at`. (§4)
 - [ ] **Bên tiêu thụ.** Phía MyTV chỉ đọc bản giao qua
   `delivery_root/CURRENT.json` và kiểm tra hash của manifest cùng từng file
   (`recsys_vnpt.export.read_current_delivery` làm đúng việc này). (§7)

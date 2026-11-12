@@ -482,6 +482,27 @@ def read_partitioned_interactions(
     )
 
 
+def read_partitioned_events(
+    output_dir: str | Path,
+    start: str | pd.Timestamp,
+    end: str | pd.Timestamp,
+    time_col: str = "event_end",
+) -> pd.DataFrame:
+    """Read only event-date partitions intersecting a closed timestamp window."""
+    start_date = pd.Timestamp(start).date()
+    end_date = pd.Timestamp(end).date()
+    frames = []
+    for path in sorted(Path(output_dir).glob("event_date=*/part-*.parquet")):
+        date = pd.Timestamp(path.parent.name.split("=", 1)[1]).date()
+        if start_date <= date <= end_date:
+            frames.append(pd.read_parquet(path))
+    if not frames:
+        return pd.DataFrame()
+    events = pd.concat(frames, ignore_index=True)
+    timestamps = pd.to_datetime(events[time_col], errors="coerce")
+    return events[timestamps.between(pd.Timestamp(start), pd.Timestamp(end))].copy()
+
+
 def historical_behavior_features(
     behavior: pd.DataFrame,
     cutoff: str | pd.Timestamp,

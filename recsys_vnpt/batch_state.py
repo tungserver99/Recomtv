@@ -24,7 +24,7 @@ PHASES = {
     "inference": (
         "WAITING_INPUT",
         "VALIDATING_INPUT",
-        "PREPARING_DATA",
+        "LOADING_PREPARED_DATA",
         "LOADING_MODEL",
         "RUNNING_SHARDS",
         "MERGING",
@@ -35,7 +35,7 @@ PHASES = {
     "retrain": (
         "WAITING_INPUT",
         "VALIDATING_INPUT",
-        "PREPARING_DATA",
+        "LOADING_PREPARED_DATA",
         "TRAINING",
         "EVALUATING",
         "GATING",
@@ -44,10 +44,16 @@ PHASES = {
     "qualification": (
         "WAITING_INPUT",
         "VALIDATING_INPUT",
-        "PREPARING_DATA",
+        "LOADING_PREPARED_DATA",
         "LOADING_MODEL",
         "MEASURING",
         "QUALIFIED",
+    ),
+    "prepare": (
+        "WAITING_INPUT",
+        "VALIDATING_INPUT",
+        "PREPARING_DATA",
+        "PREPARED",
     ),
 }
 # Terminal outcomes that are not the last phase of the happy path.

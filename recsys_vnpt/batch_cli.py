@@ -1,6 +1,7 @@
 """Production entry points.
 
     python -m recsys_vnpt.batch_cli preflight        --config CFG --batch-id ID
+    python -m recsys_vnpt.batch_cli prepare-data     --config CFG --batch-id ID
     python -m recsys_vnpt.batch_cli run-inference    --config CFG --batch-id ID
     python -m recsys_vnpt.batch_cli run-retrain      --config CFG --batch-id ID
     python -m recsys_vnpt.batch_cli qualify-hardware --config CFG --batch-id ID
@@ -24,15 +25,18 @@ from recsys_vnpt.batch_contracts import BatchError, load_and_validate_ready, loa
 def _preflight(config, batch_id: str) -> dict:
     """Checks with no side effects: the input verifies and a model is servable."""
     from recsys_vnpt.batch_runner import _check_batch_id, _promoted, _validate_input
+    from recsys_vnpt.prepared_dataset import load_prepared_dataset
 
     _check_batch_id(batch_id)
     manifest = _validate_input(config, batch_id)
+    prepared = load_prepared_dataset(config, manifest)
     _, bundle = _promoted(config)
     return {
         "batch_id": batch_id,
         "input_fingerprint": manifest.fingerprint,
         "batch_started_at": manifest.batch_started_at.isoformat(),
         "files": len(manifest.files),
+        "prepared_dataset": str(prepared.manifest_path),
         **bundle,
     }
 
@@ -40,7 +44,7 @@ def _preflight(config, batch_id: str) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("preflight", "run-inference", "run-retrain", "qualify-hardware"):
+    for name in ("preflight", "prepare-data", "run-inference", "run-retrain", "qualify-hardware"):
         command = commands.add_parser(name)
         command.add_argument("--config", required=True)
         command.add_argument("--batch-id", required=True)
@@ -64,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config(args.config)
             result = {
                 "preflight": _preflight,
+                "prepare-data": batch_runner.run_prepare_data_batch,
                 "run-inference": batch_runner.run_inference_batch,
                 "run-retrain": batch_runner.run_retrain_batch,
                 "qualify-hardware": batch_runner.qualify_hardware,

@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import time
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -55,6 +55,11 @@ from recsys_vnpt.source_manifest import (
     schema_hash,
     write_source_manifest,
 )
+
+
+def _notify_progress(callback, event: str, **fields: Any) -> None:
+    if callback is not None:
+        callback(event, **fields)
 
 def _json_frame(path: Path) -> pd.DataFrame:
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -159,6 +164,8 @@ def build_rule_membership_from_ids(
 def _iter_duration_chunks(
     project_root: Path,
     max_rows: int | None = None,
+    require_precise_create_date: bool = False,
+    progress_callback: Callable[..., None] | None = None,
 ):
     required = ["profile_id", "username", "content_id", "duration"]
     optional = [
@@ -176,45 +183,72 @@ def _iter_duration_chunks(
     found = False
     for path in sorted(duration_root.glob("*.csv")):
         found = True
+        _notify_progress(progress_callback, "duration_read", status="started", file=path.name, format="csv")
         available = list(pd.read_csv(path, nrows=0).columns)
         missing = sorted(set(required) - set(available))
         if missing:
             raise ValueError(f"{path} is missing duration columns: {missing}")
         selected = required + [column for column in optional if column in available]
+        file_rows = 0
         for chunk in pd.read_csv(path, usecols=selected, chunksize=500_000, low_memory=False):
             if remaining is not None:
                 chunk = chunk.head(remaining)
                 remaining -= len(chunk)
             if not chunk.empty:
-                yield _normalize_duration_chunk(chunk)
+                file_rows += len(chunk)
+                _notify_progress(progress_callback, "duration_chunk", file=path.name, rows=file_rows, chunk_rows=len(chunk))
+                yield _normalize_duration_chunk(chunk, require_precise_create_date=require_precise_create_date)
             if remaining is not None and remaining <= 0:
                 break
+        _notify_progress(progress_callback, "duration_read", status="completed", file=path.name, rows=file_rows)
         if remaining is not None and remaining <= 0:
             break
     if remaining is None or remaining > 0:
         for path in sorted(duration_root.glob("*.parquet")):
             found = True
+            _notify_progress(progress_callback, "duration_read", status="started", file=path.name, format="parquet")
             available = _parquet_columns(path)
             missing = sorted(set(required) - set(available))
             if missing:
                 raise ValueError(f"{path} is missing duration columns: {missing}")
+            if require_precise_create_date:
+                try:
+                    import pyarrow.parquet as pq
+                    field = pq.ParquetFile(path).schema_arrow.field("create_date")
+                    import pyarrow.types as pa_types
+                    if not (pa_types.is_timestamp(field.type) or pa_types.is_string(field.type) or pa_types.is_large_string(field.type)):
+                        raise ValueError(f"{path} create_date must retain timestamp precision")
+                except ImportError:
+                    pass
             selected = required + [column for column in optional if column in available]
             frame = pd.read_parquet(path, columns=selected)
             if remaining is not None:
                 frame = frame.head(remaining)
                 remaining -= len(frame)
             if not frame.empty:
-                yield _normalize_duration_chunk(frame)
+                _notify_progress(progress_callback, "duration_chunk", file=path.name, rows=len(frame), chunk_rows=len(frame))
+                yield _normalize_duration_chunk(frame, require_precise_create_date=require_precise_create_date)
+            _notify_progress(progress_callback, "duration_read", status="completed", file=path.name, rows=len(frame))
             if remaining is not None and remaining <= 0:
                 break
     if not found:
         raise FileNotFoundError("No duration CSV or parquet sources")
 
 
-def _normalize_duration_chunk(frame: pd.DataFrame) -> pd.DataFrame:
+def _normalize_duration_chunk(frame: pd.DataFrame, require_precise_create_date: bool = False) -> pd.DataFrame:
     output = frame.copy()
     if "member_id" not in output:
         output["member_id"] = pd.NA
+    if require_precise_create_date:
+        if "create_date" not in output:
+            raise ValueError("temporal evaluation requires precise create_date; filename_date fallback is disabled")
+        values = output["create_date"].dropna()
+        if values.empty:
+            raise ValueError("temporal evaluation requires non-empty precise create_date values")
+        text_values = values.astype("string")
+        precise = text_values.str.contains(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}", regex=True)
+        if not bool(precise.all()) and not pd.api.types.is_datetime64_any_dtype(values.dtype):
+            raise ValueError("temporal evaluation requires create_date values with hour and minute precision")
     if "create_date" not in output:
         if "filename_date" not in output:
             raise ValueError("Duration data require create_date or filename_date for temporal evaluation")
@@ -279,6 +313,8 @@ def _stream_duration_dataset(
     project_root: Path,
     interactions_path: Path,
     date_partition_path: Path,
+    require_precise_create_date: bool = False,
+    progress_callback: Callable[..., None] | None = None,
 ) -> StreamedDuration:
     staging_token = f"{os.getpid()}_{time.time_ns()}"
     temp_interactions = interactions_path.with_name(
@@ -303,7 +339,12 @@ def _stream_duration_dataset(
     dates: set[str] = set()
     try:
         for part_index, raw_chunk in enumerate(
-            _iter_duration_chunks(project_root, max_rows=None)
+            _iter_duration_chunks(
+                project_root,
+                max_rows=None,
+                require_precise_create_date=require_precise_create_date,
+                progress_callback=progress_callback,
+            )
         ):
             chunk = raw_chunk.copy()
             raw_pair = (
@@ -360,6 +401,13 @@ def _stream_duration_dataset(
                     index=False,
                 )
             rows += len(chunk)
+            _notify_progress(
+                progress_callback,
+                "duration_canonicalized",
+                rows=rows,
+                chunk_rows=len(chunk),
+                parts=part_index + 1,
+            )
             columns = tuple(map(str, chunk.columns))
 
         if rows == 0:
@@ -641,6 +689,8 @@ def prepare_canonical_project(
     target_version: str = DEFAULT_TARGET_VERSION,
     session_gap_minutes: int = DEFAULT_SESSION_GAP_MINUTES,
     user_reference_date: str | pd.Timestamp = "2025-02-20",
+    require_precise_create_date: bool = False,
+    progress_callback: Callable[..., None] | None = None,
 ) -> tuple[dict[str, Path], dict[str, Any]]:
     if max_interaction_rows is not None and max_interaction_rows < 1:
         raise ValueError("max_interaction_rows must be positive")
@@ -682,22 +732,29 @@ def prepare_canonical_project(
             "include_behavior": include_behavior,
             "target_version": target_version,
             "session_gap_minutes": session_gap_minutes,
+            "require_precise_create_date": require_precise_create_date,
         },
-        schema_version=10,
+        schema_version=12,
     )
     cache_path = output / "cache_metadata.json"
     behavior_cache_ready = (
         not include_behavior or any((output / "behavior").glob("part_*.parquet"))
+    )
+    playback_partitions_ready = any(
+        (output / "playback_events_by_date").glob("event_date=*/part-*.parquet")
     )
     if (
         not force
         and cache_is_current(cache_path, fingerprint)
         and all(path.exists() for path in paths.values())
         and behavior_cache_ready
+        and playback_partitions_ready
     ):
+        _notify_progress(progress_callback, "canonical_cache", status="reused", fingerprint=fingerprint)
         data_metrics = json.loads((output / "data_metrics.json").read_text(encoding="utf-8"))
         return paths, data_metrics
 
+    _notify_progress(progress_callback, "canonical_stage", stage="users", status="started")
     users_result = normalize_user_metadata(
         load_user_metadata(project_root=root),
         reference_date=user_reference_date,
@@ -705,12 +762,16 @@ def prepare_canonical_project(
     users_path = paths["users"]
     users_result.frame.to_parquet(users_path, index=False)
     users_result.quarantine.to_parquet(output / "users_quarantine.parquet", index=False)
+    _notify_progress(progress_callback, "canonical_stage", stage="users", status="completed", rows=len(users_result.frame))
 
     interactions_path = paths["interactions"]
     date_partition_path = output / "interactions_by_date"
+    _notify_progress(progress_callback, "canonical_stage", stage="duration_interactions", status="started")
     if max_interaction_rows is None:
         streamed = _stream_duration_dataset(
-            root, interactions_path, date_partition_path
+            root, interactions_path, date_partition_path,
+            require_precise_create_date=require_precise_create_date,
+            progress_callback=progress_callback,
         )
         raw_username_pair_counts = streamed.raw_username_counts
         username_pair_counts = streamed.username_counts
@@ -719,7 +780,15 @@ def prepare_canonical_project(
         interaction_columns = streamed.interaction_columns
         interaction_part_count = streamed.interaction_parts
     else:
-        interactions = _read_duration(root, max_interaction_rows)
+        interactions = pd.concat(
+            list(_iter_duration_chunks(
+                root,
+                max_interaction_rows,
+                require_precise_create_date=require_precise_create_date,
+                progress_callback=progress_callback,
+            )),
+            ignore_index=True,
+        )
         interactions["profile_id"] = normalize_identifier(
             interactions["profile_id"]
         )
@@ -761,6 +830,7 @@ def prepare_canonical_project(
         interaction_rows = len(interactions)
         interaction_columns = tuple(map(str, interactions.columns))
         interaction_part_count = len(interaction_parts)
+    _notify_progress(progress_callback, "canonical_stage", stage="duration_interactions", status="completed", rows=interaction_rows)
 
     raw_username_pairs = raw_username_pair_counts[
         ["profile_id", "username"]
@@ -829,14 +899,17 @@ def prepare_canonical_project(
     }
     profile_mapping.to_parquet(output / "profile_mapping.parquet", index=False)
 
+    _notify_progress(progress_callback, "canonical_stage", stage="content_snapshots", status="started")
     snapshots, tombstones, content_skipped = _content_sources(root, domain)
     skipped.extend(content_skipped)
     content_result = canonicalize_contents(snapshots, tombstones, require_recommendable=False)
     content_versions = canonicalize_content_versions(snapshots)
     content_versions.to_parquet(paths["content_versions"], index=False)
+    _notify_progress(progress_callback, "canonical_stage", stage="content_snapshots", status="completed", versions=len(content_versions))
     if not content_result.quarantine.empty:
         skipped.extend(content_result.quarantine.to_dict("records"))
 
+    _notify_progress(progress_callback, "canonical_stage", stage="tags_and_catalog", status="started")
     tag_path = _latest_json(source_artifact_path("tags", project_root=root), "TAG.json")
     content_tag_path = _latest_json(source_artifact_path("content_tags", project_root=root), "CONTENT_TO_TAG.json")
     tags = _json_frame(tag_path)
@@ -855,15 +928,18 @@ def prepare_canonical_project(
         contents["content_duration"] = pd.to_numeric(contents["content_duration"], errors="coerce")
         contents = contents[contents["content_duration"].gt(0)]
     contents = contents.drop_duplicates("content_id", keep="last").reset_index(drop=True)
+    _notify_progress(progress_callback, "canonical_stage", stage="tags_and_catalog", status="completed", contents=len(contents), tags=len(content_tags))
     contents_path = paths["contents"]
     content_tags_path = paths["content_tags"]
     content_tags.to_parquet(content_tags_path, index=False)
 
+    _notify_progress(progress_callback, "canonical_stage", stage="rule_membership", status="started")
     rules = pd.read_parquet(rule_info_path(root))
     membership = build_rule_membership_from_ids(content_tags, rules)
     membership = membership[membership["content_id"].astype(str).isin(set(contents["content_id"].astype(str)))]
     membership_path = paths["membership"]
     membership.to_parquet(membership_path, index=False)
+    _notify_progress(progress_callback, "canonical_stage", stage="rule_membership", status="completed", pairs=len(membership))
 
     interaction_catalog_audit = _interaction_catalog_audit(
         interactions_path,
@@ -874,6 +950,7 @@ def prepare_canonical_project(
         interactions_path,
         content_ids=set(contents["content_id"].astype(str)),
     )
+    _notify_progress(progress_callback, "canonical_stage", stage="playback_events_and_labels", status="started")
     playback_events, sessions, label_metrics = build_playback_events(
         playback_source,
         session_gap_minutes=session_gap_minutes,
@@ -902,7 +979,14 @@ def prepare_canonical_project(
     contents = apply_atomic_duration(contents, label_contract)
     contents.to_parquet(contents_path, index=False)
     playback_events.to_parquet(paths["playback_events"], index=False)
+    playback_partitions = output / "playback_events_by_date"
+    if playback_partitions.exists():
+        shutil.rmtree(playback_partitions)
+    playback_event_partitions = write_partitioned_interactions(
+        playback_events, playback_partitions, time_col="event_end"
+    )
     sessions.to_parquet(paths["sessions"], index=False)
+    _notify_progress(progress_callback, "canonical_stage", stage="playback_events_and_labels", status="completed", events=len(playback_events), sessions=len(sessions))
     label_contract.save(paths["label_contract"])
     label_metrics.update(
         {
@@ -925,7 +1009,9 @@ def prepare_canonical_project(
     counts = membership[~membership["rule_id"].astype(str).isin(SPECIAL_RULES)].groupby("rule_id")["content_id"].nunique()
     behavior_metrics: dict[str, int] = {}
     if include_behavior:
+        _notify_progress(progress_callback, "canonical_stage", stage="behavior", status="started")
         _, behavior_metrics = _write_behavior_parts(root, output / "behavior", max_behavior_rows)
+        _notify_progress(progress_callback, "canonical_stage", stage="behavior", status="completed", rows=behavior_metrics.get("behavior_canonical_rows", 0))
         # Shown-not-watched exposure, used only when impression negatives are requested.
         impression_sources = sorted(
             source_artifact_path("behavior", project_root=root).glob("*.csv")
@@ -994,6 +1080,7 @@ def prepare_canonical_project(
         "source_interaction_rows": interaction_rows,
         "playback_source_rows": len(playback_source),
         "playback_source_rate": len(playback_source) / max(interaction_rows, 1),
+        "playback_event_date_partitions": len(playback_event_partitions),
         "interaction_catalog_audit": interaction_catalog_audit,
         "source_fingerprint": source_fingerprint,
         "canonical_fingerprint": fingerprint,
@@ -1028,4 +1115,5 @@ def prepare_canonical_project(
         json.dumps(data_metrics, indent=2, sort_keys=True), encoding="utf-8"
     )
     cache_path.write_text(json.dumps({"fingerprint": fingerprint}, indent=2), encoding="utf-8")
+    _notify_progress(progress_callback, "canonical_stage", stage="complete", status="completed", rows=interaction_rows, contents=len(contents))
     return paths, data_metrics

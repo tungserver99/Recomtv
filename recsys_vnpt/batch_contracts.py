@@ -35,6 +35,7 @@ EXIT_CODES = {
     "SCHEMA_DRIFT": 12,
     "BATCH_LOCKED": 13,
     "CONFIG_INVALID": 14,
+    "PREPARED_DATA_UNAVAILABLE": 15,
     "MODEL_UNAVAILABLE": 20,
     "RETRAIN_FAILED": 21,
     "QUALITY_GATE_FAILED": 22,
@@ -83,6 +84,9 @@ class BatchConfig:
     model_registry: str
     schema_version: int = CONFIG_SCHEMA_VERSION
     domain: str = "all"
+    time_train: int = 24
+    time_valid: int = 24
+    time_test: int = 24
     input_wait_seconds: int = 3600
     poll_seconds: int = 30
     min_free_bytes: int = 10 * 1024**3
@@ -128,6 +132,10 @@ class BatchConfig:
             problems.append(f"schema_version must be {CONFIG_SCHEMA_VERSION}")
         if self.domain not in {"all", "clip", "movie", "music"}:
             problems.append("domain must be all, clip, movie or music")
+        for name in ("time_train", "time_valid", "time_test"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                problems.append(f"{name} must be a positive integer")
         if self.num_shards < 1 or self.workers < 1:
             problems.append("num_shards and workers must be positive")
         if self.shard_retries < 0:
@@ -198,6 +206,7 @@ class BatchConfig:
         under a different one are never reused."""
         operational = {
             "incoming_root", "work_root", "delivery_root", "model_registry",
+            "time_train", "time_valid", "time_test",
             "input_wait_seconds", "poll_seconds", "min_free_bytes", "workers", "shard_retries",
             "num_shards", "gate_max_regression", "gate_evaluation_profiles", "sla_seconds",
             "qualification_workloads", "qualification_repetitions",
@@ -264,6 +273,14 @@ def _aware(value: Any, name: str) -> datetime:
     return parsed
 
 
+def batch_started_at_from_metadata(metadata: dict[str, Any]) -> datetime:
+    """Read new timestamps or map a legacy data_cutoff for old records."""
+    value = metadata.get("batch_started_at")
+    if value is None:
+        value = metadata.get("data_cutoff")
+    return _aware(value, "batch_started_at")
+
+
 def _listed_files(batch_dir: Path) -> set[str]:
     return {
         path.relative_to(batch_dir).as_posix()
@@ -272,8 +289,18 @@ def _listed_files(batch_dir: Path) -> set[str]:
     }
 
 
-def load_and_validate_ready(batch_dir: str | Path, batch_id: str) -> ReadyManifest:
-    """Parse ``_READY.json`` and verify every file it lists, byte for byte."""
+def load_and_validate_ready(
+    batch_dir: str | Path,
+    batch_id: str,
+    *,
+    verify_checksums: bool = True,
+) -> ReadyManifest:
+    """Parse ``_READY.json`` and optionally verify every listed file byte for byte.
+
+    Consumers of an already prepared immutable batch may set
+    ``verify_checksums=False``. That still checks file presence, size, safe paths,
+    required sources, and the exact listed-file set without reading the raw bytes.
+    """
     batch_dir = Path(batch_dir)
     ready_path = batch_dir / READY_FILE
     try:
@@ -322,7 +349,7 @@ def load_and_validate_ready(batch_dir: str | Path, batch_id: str) -> ReadyManife
             raise BatchError("INPUT_INTEGRITY", f"invalid sha256 for {relative}")
         if resolved.stat().st_size != entry.get("size_bytes"):
             raise BatchError("INPUT_INTEGRITY", f"size mismatch: {relative}")
-        if sha256_file(resolved) != digest:
+        if verify_checksums and sha256_file(resolved) != digest:
             raise BatchError("INPUT_INTEGRITY", f"checksum mismatch: {relative}")
         files.append({"path": relative, "size_bytes": entry["size_bytes"], "sha256": digest})
 
@@ -336,15 +363,17 @@ def load_and_validate_ready(batch_dir: str | Path, batch_id: str) -> ReadyManife
     missing = [name for name in REQUIRED_SOURCES if name not in present]
     if missing:
         raise BatchError("INPUT_INTEGRITY", f"required sources are missing: {missing}")
-    started_at = raw.get("batch_started_at")
-    if started_at is None and schema_version == LEGACY_READY_SCHEMA_VERSION:
-        started_at = raw.get("data_cutoff")
     return ReadyManifest(
         batch_id=batch_id,
-        batch_started_at=_aware(started_at, "batch_started_at"),
+        batch_started_at=batch_started_at_from_metadata(raw),
         created_at=_aware(raw.get("created_at"), "created_at"),
         files=tuple(sorted(files, key=lambda row: row["path"])),
     )
+
+
+def load_ready_manifest_identity(batch_dir: str | Path, batch_id: str) -> ReadyManifest:
+    """Quickly validate the committed manifest without rereading large sources."""
+    return load_and_validate_ready(batch_dir, batch_id, verify_checksums=False)
 
 
 def wait_for_ready(

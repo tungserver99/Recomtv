@@ -14,7 +14,7 @@ chứng sẵn sàng cho production.
 
 Tạo một Kaggle dataset **private** cho source bundle và gắn dataset đó làm input
 của một notebook GPU. Source bundle cần chứa code của repository và
-`requirements-kaggle.txt`; bootstrap loại trừ `data/` và `.git/` khi chép code
+`requirements.txt`; bootstrap loại trừ `data/` và `.git/` khi chép code
 sang vùng lưu trữ ghi được. Không đặt output thô ở mức profile vào dataset public.
 Chỉ cấp quyền cộng tác dataset cho người đã được phê duyệt, và ghi lại phiên bản
 bất biến của dataset MyTV dùng cho lượt chạy thật.
@@ -45,8 +45,9 @@ thực tế của source đã mount:
 Preflight phải báo một phép toán tensor thành công trên CUDA. Chỉ thấy GPU hoặc
 `torch.cuda.is_available()` trả về true là chưa đủ; bộ chạy fail-closed và không
 chuyển sang huấn luyện trên CPU. Nếu phép toán kernel thất bại, hãy chọn
-accelerator/runtime Kaggle được hỗ trợ và chạy lại từ một phiên sạch. Không cài
-`requirements-cuda.txt` đè lên bản Torch sẵn có của Kaggle.
+accelerator/runtime Kaggle được hỗ trợ và chạy lại từ một phiên sạch. Bootstrap
+dùng chung `requirements.txt` nhưng bỏ qua PyTorch và wheel index để giữ bản
+Torch sẵn có của Kaggle.
 
 ## Dry-run trên dữ liệu private
 

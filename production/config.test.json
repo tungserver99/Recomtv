@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "timezone": "Asia/Ho_Chi_Minh",
+  "schedule": {
+    "enabled": false,
+    "run_times": ["00:00", "12:00"]
+  },
+  "data_root": "data/data",
+  "batch": {
+    "schema_version": 1,
+    "domain": "all",
+    "time_train": 24,
+    "time_valid": 24,
+    "time_test": 24,
+    "incoming_root": "data/production-test/incoming",
+    "work_root": "data/production-test/work",
+    "delivery_root": "data/production-test/delivery",
+    "model_registry": "data/production-test/model_registry",
+    "combination": "GxEp",
+    "input_wait_seconds": 0,
+    "min_free_bytes": 0,
+    "num_shards": 1,
+    "workers": 1,
+    "gate_evaluation_profiles": 500,
+    "max_profiles": 1000,
+    "gbdt_device": "cuda",
+    "fcn_epochs": 2,
+    "fcn_schedule_epochs": 30
+  }
+}

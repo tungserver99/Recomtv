@@ -122,6 +122,19 @@ def test_legacy_ready_manifest_maps_data_cutoff_to_batch_start_without_rewriting
     assert json.loads((batch / "_READY.json").read_text())["schema_version"] == 1
 
 
+def test_batch_timestamp_reader_prefers_new_field_and_falls_back_to_legacy_data_cutoff():
+    from recsys_vnpt.batch_contracts import batch_started_at_from_metadata
+
+    legacy = {"data_cutoff": "2025-03-01T08:30:00+00:00"}
+    current = {
+        "batch_started_at": "2025-03-02T08:30:00+00:00",
+        "data_cutoff": "2025-03-01T08:30:00+00:00",
+    }
+
+    assert batch_started_at_from_metadata(legacy) == BATCH_STARTED
+    assert batch_started_at_from_metadata(current) == datetime(2025, 3, 2, 8, 30, tzinfo=timezone.utc)
+
+
 def test_waiting_for_input_times_out_without_sleeping_for_real(tmp_path):
     clock = iter(range(0, 1000, 10))
     with pytest.raises(BatchError, match="INPUT_TIMEOUT") as error:

@@ -1,6 +1,8 @@
 import pandas as pd
+import pytest
 
 from recsys_vnpt.canonical import (
+    read_partitioned_events,
     select_content_metadata_as_of,
     write_partitioned_interactions,
 )
@@ -161,22 +163,137 @@ def test_as_of_metadata_and_date_partitions(tmp_path):
 def test_relative_windows_derive_from_data_and_roundtrip(tmp_path):
     import pandas as pd
 
-    windows = derive_relative_temporal_windows(pd.Timestamp("2026-06-30 17:45"))
+    windows = derive_relative_temporal_windows(
+        pd.Timestamp("2026-11-12 20:00"), time_train=24, time_valid=24, time_test=24
+    )
     assert [w.name for w in windows] == [
         "train_1", "train_2", "train_3", "validation", "test",
     ]
     assert [w.split for w in windows] == [
         "train", "train", "train", "validation", "test",
     ]
-    assert windows[-1].label_end.date() == pd.Timestamp("2026-06-30").date()
+    assert windows[0].label_start == pd.Timestamp("2026-11-07 20:00")
+    assert windows[0].label_end == pd.Timestamp("2026-11-08 19:59:59.999999999")
+    assert windows[-1].label_start == pd.Timestamp("2026-11-11 20:00")
+    assert windows[-1].label_end == pd.Timestamp("2026-11-12 20:00")
     for earlier, later in zip(windows, windows[1:]):
-        # contiguous, non-overlapping 10-day windows; history ends just before labels
+        # contiguous, non-overlapping hour windows; history ends just before labels
         assert later.label_start == earlier.label_end + pd.Timedelta(1, unit="ns")
         assert later.history_end < later.label_start
     # persisted definitions round-trip; missing file falls back to pinned defaults
-    write_temporal_windows(tmp_path, windows)
+    time_config = {"mode": "relative", "time_train": 24, "time_valid": 24, "time_test": 24}
+    write_temporal_windows(tmp_path, windows, time_config=time_config)
     assert load_temporal_windows(tmp_path) == windows
+    import json
+    assert json.loads((tmp_path / "windows.json").read_text())["time_config"] == time_config
     assert load_temporal_windows(tmp_path / "absent") == DEFAULT_TEMPORAL_WINDOWS
+
+
+def test_partitioned_event_read_loads_only_intersecting_dates_and_exact_times(tmp_path, monkeypatch):
+    root = tmp_path / "events"
+    for date in ("2025-01-01", "2025-01-02", "2025-01-03"):
+        part = root / f"event_date={date}" / "part-00000.parquet"
+        part.parent.mkdir(parents=True)
+        part.touch()
+    data = {
+        "2025-01-01": pd.DataFrame({"event_end": ["2025-01-01 23:00"], "id": [1]}),
+        "2025-01-02": pd.DataFrame({"event_end": ["2025-01-02 12:00", "2025-01-02 16:00"], "id": [2, 3]}),
+    }
+    read_paths = []
+
+    def fake_read_parquet(path):
+        read_paths.append(Path(path))
+        return data[Path(path).parent.name.split("=", 1)[1]]
+
+    from pathlib import Path
+    monkeypatch.setattr(pd, "read_parquet", fake_read_parquet)
+
+    result = read_partitioned_events(root, "2025-01-02 00:00", "2025-01-02 12:00")
+
+    assert len(read_paths) == 1
+    assert read_paths[0].parent.name == "event_date=2025-01-02"
+    assert result["id"].tolist() == [2]
+
+
+def test_relative_windows_use_unequal_hours_across_month_boundary():
+    import pandas as pd
+
+    windows = derive_relative_temporal_windows(
+        pd.Timestamp("2027-01-01 01:15"), time_train=12, time_valid=6, time_test=3
+    )
+    assert [(window.name, window.label_start, window.label_end) for window in windows] == [
+        ("train_1", pd.Timestamp("2026-12-30 04:15"), pd.Timestamp("2026-12-30 16:14:59.999999999")),
+        ("train_2", pd.Timestamp("2026-12-30 16:15"), pd.Timestamp("2026-12-31 04:14:59.999999999")),
+        ("train_3", pd.Timestamp("2026-12-31 04:15"), pd.Timestamp("2026-12-31 16:14:59.999999999")),
+        ("validation", pd.Timestamp("2026-12-31 16:15"), pd.Timestamp("2026-12-31 22:14:59.999999999")),
+        ("test", pd.Timestamp("2026-12-31 22:15"), pd.Timestamp("2027-01-01 01:15")),
+    ]
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True])
+def test_relative_windows_reject_non_positive_integer_hour_values(value):
+    import pandas as pd
+    import pytest
+
+    with pytest.raises(ValueError, match="positive integer"):
+        derive_relative_temporal_windows(pd.Timestamp("2026-11-12 20:00"), time_train=value)
+
+
+def test_temporal_window_fingerprint_changes_when_hours_change():
+    import pandas as pd
+
+    from recsys_vnpt.temporal import temporal_window_fingerprint
+
+    maximum = pd.Timestamp("2026-11-12 20:00")
+    daily = derive_relative_temporal_windows(maximum, 24, 24, 24)
+    shorter = derive_relative_temporal_windows(maximum, 12, 6, 3)
+
+    assert temporal_window_fingerprint(daily, "relative", 24, 24, 24) != temporal_window_fingerprint(
+        shorter, "relative", 12, 6, 3
+    )
+
+
+def test_relative_window_coverage_rejects_a_window_without_positive_samples():
+    import pandas as pd
+    import pytest
+
+    from recsys_vnpt.temporal import validate_window_positives
+
+    frames = {name: pd.DataFrame({"label": [1]}) for name in ("train_1", "train_2", "train_3", "validation", "test")}
+    frames["validation"] = pd.DataFrame({"label": [0, 0]})
+
+    with pytest.raises(ValueError, match="validation.*positive"):
+        validate_window_positives(frames)
+
+
+def test_strict_duration_timestamps_reject_day_only_and_filename_fallback():
+    import pytest
+    from recsys_vnpt.prepare import _normalize_duration_chunk
+
+    base = {"profile_id": ["p"], "username": ["u"], "content_id": ["c"], "duration": [10]}
+    with pytest.raises(ValueError, match="requires precise create_date"):
+        _normalize_duration_chunk(pd.DataFrame({**base, "filename_date": ["20261112"]}), True)
+    with pytest.raises(ValueError, match="hour and minute precision"):
+        _normalize_duration_chunk(pd.DataFrame({**base, "create_date": ["2026-11-12"]}), True)
+    normalized = _normalize_duration_chunk(
+        pd.DataFrame({**base, "create_date": ["2026-11-12 20:15:00"]}), True
+    )
+    assert normalized.loc[0, "create_date"] == pd.Timestamp("2026-11-12 20:15:00")
+
+
+def test_test_split_training_windows_include_validation_but_never_test(tmp_path):
+    import pandas as pd
+
+    from recsys_vnpt.rule_scorer import training_windows
+    from recsys_vnpt.temporal import derive_relative_temporal_windows, write_temporal_windows
+
+    temporal = tmp_path / "temporal"
+    windows = derive_relative_temporal_windows(pd.Timestamp("2026-11-12 20:00"))
+    write_temporal_windows(temporal, windows)
+
+    assert [window.name for window in training_windows(tmp_path, "test")] == [
+        "train_1", "train_2", "train_3", "validation"
+    ]
 
 
 def test_backfill_keeps_descriptive_attributes_but_not_merchandising_ones():

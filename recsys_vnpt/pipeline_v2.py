@@ -3,13 +3,14 @@ import json
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
 from recsys_vnpt.canonical import (
     cache_is_current,
     historical_behavior_features_from_parts,
+    read_partitioned_events,
     select_content_metadata_as_of,
 )
 from recsys_vnpt.engagement import (
@@ -57,6 +58,8 @@ from recsys_vnpt.temporal import (
     persist_temporal_artifact,
     select_smoke_profile_cohort,
     split_aware_catalog_cap,
+    temporal_window_fingerprint,
+    validate_window_positives,
     write_temporal_windows,
 )
 
@@ -86,9 +89,15 @@ def build_temporal_project(
     target_version: str = DEFAULT_TARGET_VERSION,
     sequence_mode: str = "historical",
     window_mode: str = "pinned",
+    time_train: int = 24,
+    time_valid: int = 24,
+    time_test: int = 24,
     impression_weight: float = 1.0,
+    progress_callback: Callable[..., None] | None = None,
 ) -> dict[str, Path]:
     temporal_build_started = time.perf_counter()
+    if progress_callback:
+        progress_callback("temporal_stage", stage="load_canonical", status="started")
     root = Path(project_root).resolve()
     canonical = data_artifact_path("canonical", domain, project_root=root)
     if target_version != DEFAULT_TARGET_VERSION:
@@ -127,6 +136,11 @@ def build_temporal_project(
     content_versions = (
         pd.read_parquet(versions_path) if versions_path.exists() else pd.DataFrame()
     )
+    if progress_callback:
+        progress_callback(
+            "temporal_stage", stage="load_canonical", status="completed",
+            interactions=len(interactions), profiles=interactions["profile_id"].nunique(),
+        )
 
     if window_mode == "relative":
         max_event = pd.to_datetime(
@@ -136,7 +150,9 @@ def build_temporal_project(
             raise ValueError(
                 "relative temporal windows require interactions with create_date"
             )
-        temporal_windows = derive_relative_temporal_windows(max_event)
+        temporal_windows = derive_relative_temporal_windows(
+            max_event, time_train=time_train, time_valid=time_valid, time_test=time_test
+        )
     elif window_mode == "pinned":
         temporal_windows = DEFAULT_TEMPORAL_WINDOWS
     else:
@@ -144,27 +160,49 @@ def build_temporal_project(
 
     # Labels are created before any smoke cap. Entity caps therefore cannot erase
     # the evidence that decides which profile/content rows enter the cohort.
-    labeled_windows = {
-        window.name: label_engagement_window(
-            playback_events,
+    if progress_callback:
+        progress_callback("temporal_stage", stage="label_windows", status="started", windows=len(temporal_windows))
+    labeled_windows = {}
+    legacy_deduplicated_windows = {}
+    playback_partitions = canonical / "playback_events_by_date"
+    for window in temporal_windows:
+        if progress_callback:
+            progress_callback("temporal_window", window=window.name, stage="labeling", status="started")
+        window_events = (
+            read_partitioned_events(
+                playback_partitions, window.label_start, window.label_end
+            )
+            if playback_partitions.is_dir()
+            else playback_events[
+                pd.to_datetime(playback_events["event_end"], errors="coerce").between(
+                    window.label_start, window.label_end
+                )
+            ]
+        )
+        labeled_windows[window.name] = label_engagement_window(
+            window_events,
             items,
             label_contract,
             window.label_start,
             window.label_end,
         )
-        for window in temporal_windows
-    }
-    legacy_audit_windows = {
-        window.name: label_future_window(interactions, items, window, domain)
-        for window in temporal_windows
-    }
-    deduplicated_legacy_input = playback_events.rename(
-        columns={"watch_seconds": "duration", "event_end": "create_date"}
-    )
-    legacy_deduplicated_windows = {
-        window.name: label_future_window(
+        deduplicated_legacy_input = window_events.rename(
+            columns={"watch_seconds": "duration", "event_end": "create_date"}
+        )
+        legacy_deduplicated_windows[window.name] = label_future_window(
             deduplicated_legacy_input, items, window, domain
         )
+        if progress_callback:
+            progress_callback(
+                "temporal_window", window=window.name, stage="labeling", status="completed",
+                rows=len(labeled_windows[window.name]),
+            )
+    if progress_callback:
+        progress_callback("temporal_stage", stage="label_windows", status="completed")
+    if window_mode == "relative":
+        validate_window_positives(labeled_windows)
+    legacy_audit_windows = {
+        window.name: label_future_window(interactions, items, window, domain)
         for window in temporal_windows
     }
     label_metrics_path = canonical / "label_metrics.json"
@@ -283,7 +321,13 @@ def build_temporal_project(
     }
     temporal = canonical / "temporal"
     temporal.mkdir(parents=True, exist_ok=True)
-    write_temporal_windows(temporal, temporal_windows)
+    time_config = {
+        "mode": window_mode,
+        "time_train": time_train if window_mode == "relative" else None,
+        "time_valid": time_valid if window_mode == "relative" else None,
+        "time_test": time_test if window_mode == "relative" else None,
+    }
+    write_temporal_windows(temporal, temporal_windows, time_config=time_config)
     expected_names = [window.name for window in temporal_windows] + [
         "validation_candidates",
         "test_candidates",
@@ -301,7 +345,9 @@ def build_temporal_project(
             "canonical": canonical_fingerprint_value,
             "max_profiles": max_profiles,
             "max_contents": max_contents,
-            "windows": [asdict(window) for window in temporal_windows],
+            "window_fingerprint": temporal_window_fingerprint(
+                temporal_windows, window_mode, time_train, time_valid, time_test
+            ),
             "seed": seed,
             "train_negative_policy": "2_same_rule_1_popularity_1_uniform",
             "positive_policy": "novel_not_consumed",
@@ -321,12 +367,16 @@ def build_temporal_project(
         and cache_is_current(temporal_cache, temporal_fingerprint)
         and all(path.exists() for path in expected_paths.values())
     ):
+        if progress_callback:
+            progress_callback("temporal_cache", status="reused", fingerprint=temporal_fingerprint)
         return expected_paths
     behavior_paths = sorted((canonical / "behavior").glob("part_*.parquet"))
     outputs: dict[str, Path] = {}
     window_timings: dict[str, dict[str, float]] = {}
     positive_policy_counts: dict[str, dict[str, int]] = {}
     for window in temporal_windows:
+        if progress_callback:
+            progress_callback("temporal_window", window=window.name, stage="features_sampling_candidates", status="started")
         raw_positives = labeled_windows[window.name][
             labeled_windows[window.name]["label"].eq(1)
         ].drop_duplicates(["profile_id", "content_id"])
@@ -372,6 +422,8 @@ def build_temporal_project(
     )
     impression_window_counts: dict[str, int] = {}
     for window in temporal_windows:
+        if progress_callback:
+            progress_callback("temporal_window", window=window.name, stage="features_sampling_candidates", status="started")
         window_started = time.perf_counter()
         sampling_seconds = 0.0
         feature_seconds = 0.0
@@ -507,6 +559,11 @@ def build_temporal_project(
             "candidate_generation_and_persist_seconds": candidate_seconds,
             "total_seconds": time.perf_counter() - window_started,
         }
+        if progress_callback:
+            progress_callback(
+                "temporal_window", window=window.name, stage="features_sampling_candidates", status="completed",
+                rows=len(frame), candidates=len(candidates) if window.split in {"validation", "test"} else 0,
+            )
     temporal_build_seconds = time.perf_counter() - temporal_build_started
     build_config["window_timings"] = window_timings
     build_config["impression_negative_rows"] = impression_window_counts

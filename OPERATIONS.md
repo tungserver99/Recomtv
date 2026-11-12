@@ -31,8 +31,9 @@ git clone https://github.com/Itvc0110/RecSys-VNPT.git && cd RecSys-VNPT
 python -m pip install -r requirements.txt
 ```
 
-Yêu cầu Python 3.10 trở lên. Luồng batch chạy được trên CPU; scorer XGBoost và
-FCN dùng GPU CUDA khi máy có, với wheel CUDA trong `requirements-cuda.txt`.
+Yêu cầu Python 3.10 trở lên. Cài toàn bộ dependency bằng `requirements.txt`,
+bao gồm PyTorch CUDA 12.8. Luồng batch chạy được trên CPU; scorer XGBoost và
+FCN dùng GPU CUDA khi máy có.
 `scikit-learn` và `xgboost` được ghim phiên bản vì bundle huấn luyện bằng phiên
 bản khác sẽ bị từ chối thay vì được tin dùng; máy chủ retrain và máy chủ inference
 phải cài cùng một bộ requirements. Khi triển khai không kèm `.git`, đặt
@@ -72,9 +73,9 @@ không bao giờ suy đoán batch đã đầy đủ dựa trên timestamp.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "batch_id": "20260923T0000",
-  "data_cutoff": "2026-09-22T23:59:59+07:00",
+  "batch_started_at": "2026-09-23T00:00:00+07:00",
   "created_at": "2026-09-23T00:30:00+07:00",
   "files": [
     {"path": "duration/part-00001.parquet", "size_bytes": 123456, "sha256": "<64 lowercase hex>"}
@@ -88,8 +89,8 @@ Các quy tắc, quy tắc nào cũng được kiểm tra (nếu vi phạm: `INPU
   file không được liệt kê sẽ bị từ chối, vì các bộ đọc glob toàn bộ thư mục;
 - đường dẫn theo chuẩn POSIX, tương đối, không chứa `..`, và không được thoát ra
   ngoài thư mục qua symlink;
-- `data_cutoff` có múi giờ và, với inference, phải muộn hơn cutoff của bản giao
-  đang được xuất bản;
+- `batch_started_at` có múi giờ và dùng để sắp thứ tự batch; nó không lọc dữ liệu
+  tương tác. READY cũ chỉ có `data_cutoff` vẫn được đọc như timestamp lịch sử;
 - phải có `duration/`, `mytv_vmp_content/`, `tags/`, `content_tags/` và
   `month_mytv_info.parquet`. `behavior/` chỉ được đọc khi `include_behavior` là
   true. Nếu batch không kèm `rule_info.parquet`, hệ thống dùng bản trong
@@ -99,8 +100,7 @@ Batch id có thể dùng chữ cái, chữ số và `. _ + -`. Bản triển kha
 bên cung cấp:
 
 ```bash
-python -m recsys_vnpt.batch_cli make-ready --batch-dir /srv/recsys/incoming/20260923T0000 \
-    --data-cutoff 2026-09-22T23:59:59+07:00
+python -m recsys_vnpt.batch_cli make-ready --batch-dir /srv/recsys/incoming/20260923T0000
 ```
 
 Snapshot nội dung phải có các cột `content_id`, `type_id`, `content_duration`,
@@ -189,7 +189,7 @@ Bên tiêu thụ phải đi qua `CURRENT.json`, không bao giờ tự liệt kê
 `recsys_vnpt.export.read_current_delivery` làm đúng các bước trên. Một generation
 không bao giờ bị sửa sau khi xuất bản; generation mới thay thế `CURRENT.json` một
 cách atomic. Định dạng file nằm ở `PRD.md` §2. `<date>` trong tên file là ngày
-`data_cutoff` của batch.
+`batch_started_at` của batch; `serving_cutoff` vẫn lấy từ lịch sử tương tác.
 
 ## 8. Giám sát và khôi phục
 

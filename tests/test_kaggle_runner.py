@@ -190,14 +190,17 @@ def test_kaggle_bootstrap_and_requirements_are_portable():
         if line.strip()
     }
     kaggle = {
-        line.strip()
-        for line in (root / "requirements-kaggle.txt").read_text().splitlines()
-        if line.strip()
+        line for line in base
+        if not line.startswith("torch==") and not line.startswith("--extra-index-url")
     }
-    assert kaggle == {line for line in base if not line.startswith("torch==")}
+    assert "torch==2.7.0+cu128" in base
+    assert kaggle <= base
     script = (root / "kaggle" / "bootstrap.sh").read_text()
     assert "python -m experiments.kaggle_runner" in script
-    assert "requirements-cuda.txt" not in script
+    assert "requirements-kaggle.txt" in script  # generated in the work dir
+    assert "grep -Ev" in script
+    assert "--extra-index-url|torch==" in script
+    assert '"$work_dir/repo/requirements.txt"' in script
     assert "--exclude='./data'" in script
     assert "source and working roots overlap" in script
     guide = (root / "docs" / "KAGGLE_TESTING.md").read_text(encoding="utf-8")
