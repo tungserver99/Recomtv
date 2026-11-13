@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -136,12 +137,28 @@ def _check_batch_id(batch_id: str) -> None:
 
 
 @contextmanager
-def _roots(source: Path, data: Path) -> Iterator[None]:
+def _roots(
+    source: Path,
+    data: Path,
+    temporal: Path | None = None,
+    data_end_at=None,
+) -> Iterator[None]:
     """Point the raw readers at the batch and generated artifacts at ``data``."""
-    names = ("RECSYS_VNPT_SOURCE_ROOT", "RECSYS_VNPT_DATA_ROOT")
+    names = (
+        "RECSYS_VNPT_SOURCE_ROOT", "RECSYS_VNPT_DATA_ROOT",
+        "RECSYS_VNPT_TEMPORAL_ROOT", "RECSYS_VNPT_DATA_END_AT",
+    )
     saved = {name: os.environ.get(name) for name in names}
     os.environ["RECSYS_VNPT_SOURCE_ROOT"] = str(source)
     os.environ["RECSYS_VNPT_DATA_ROOT"] = str(data)
+    if temporal is not None:
+        os.environ["RECSYS_VNPT_TEMPORAL_ROOT"] = str(temporal)
+    else:
+        os.environ.pop("RECSYS_VNPT_TEMPORAL_ROOT", None)
+    if data_end_at is not None:
+        os.environ["RECSYS_VNPT_DATA_END_AT"] = str(data_end_at)
+    else:
+        os.environ.pop("RECSYS_VNPT_DATA_END_AT", None)
     try:
         yield
     finally:
@@ -373,7 +390,18 @@ def sample_profiles(profile_ids: list[str], limit: int) -> list[str]:
     return sorted(profile_ids, key=lambda pid: hashlib.sha256(pid.encode("utf-8")).hexdigest())[:limit]
 
 
-def _profile_ids(domain: str) -> list[str]:
+def _profile_ids(domain: str, data_end_at=None, progress_callback=None) -> list[str]:
+    if data_end_at is not None:
+        canonical = data_artifact_path("canonical", domain, project_root=PROJECT_ROOT)
+        from recsys_vnpt.prepare import _read_canonical_interactions
+
+        interactions = _read_canonical_interactions(
+            canonical / "interactions.parquet",
+            columns=["profile_id"],
+            data_end_at=data_end_at,
+            progress_callback=progress_callback,
+        )
+        return interactions["profile_id"].astype(str).drop_duplicates().tolist()
     mapping = pd.read_parquet(
         data_artifact_path("canonical", domain, "profile_mapping.parquet", project_root=PROJECT_ROOT),
         columns=["profile_id"],
@@ -381,24 +409,47 @@ def _profile_ids(domain: str) -> list[str]:
     return mapping["profile_id"].astype(str).drop_duplicates().tolist()
 
 
-def _promoted(config: BatchConfig) -> tuple[Path | None, dict[str, Any]]:
-    """The promoted bundle, verified loadable, or no bundle when the
-    configuration serves only the hand-built orderings."""
+def _promoted(
+    config: BatchConfig,
+    *,
+    model_path: str | Path | None = None,
+) -> tuple[Path | None, dict[str, Any]]:
+    """Return a verified explicit bundle, or the promoted bundle by default."""
     if not config.uses_learned_scorers:
+        if model_path is not None:
+            raise BatchError("MODEL_UNAVAILABLE", "the configured ordering does not use a learned model bundle")
         return None, {"bundle_id": None, "model_sha256": None}
-    bundle = promoted_bundle(config.root("model_registry"))
-    if bundle is None:
-        raise BatchError(
-            "MODEL_UNAVAILABLE",
-            "no promoted scorer bundle; run run-retrain first, or configure a "
-            "combination that uses no learned model (HxH, HsegxHseg)",
-        )
+    if model_path is not None:
+        try:
+            bundle = Path(model_path).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise BatchError("MODEL_UNAVAILABLE", f"model bundle path is unavailable: {error}") from error
+        if not bundle.is_dir():
+            raise BatchError("MODEL_UNAVAILABLE", f"model bundle path is not a directory: {bundle}")
+        model_source = "explicit"
+    else:
+        bundle = promoted_bundle(config.root("model_registry"))
+        if bundle is None:
+            raise BatchError(
+                "MODEL_UNAVAILABLE",
+                "no promoted scorer bundle; run run-retrain first, or configure a "
+                "combination that uses no learned model (HxH, HsegxHseg)",
+            )
+        bundle = bundle.resolve()
+        model_source = "promoted"
     try:
         _, _, manifest = load_bundle(bundle)
         load_bundle_fcn(bundle, config.ordering.fcn_families)
-    except (BundleError, OSError) as error:
+    except (BundleError, OSError, ValueError, KeyError) as error:
         raise BatchError("MODEL_UNAVAILABLE", str(error)) from error
-    return bundle, {"bundle_id": manifest["bundle_id"], "model_sha256": bundle_identity(manifest)}
+    return bundle, {
+        "bundle_id": manifest["bundle_id"],
+        "model_sha256": bundle_identity(manifest),
+        "model_data_end_at": manifest.get("data_end_at"),
+        "model_serving_cutoff": manifest.get("serving_cutoff"),
+        "model_source": model_source,
+        "model_path": str(bundle),
+    }
 
 
 # --- shards ----------------------------------------------------------------------
@@ -416,7 +467,7 @@ def assign_shards(profile_ids: list[str], num_shards: int) -> list[list[str]]:
     return shards
 
 
-def _serving_context(config: BatchConfig, bundle: str | None):
+def _serving_context(config: BatchConfig, bundle: str | None, data_end_at=None, progress_callback=None):
     from recsys_vnpt.serving import (
         _member_id_map,
         load_serving_context,
@@ -438,6 +489,8 @@ def _serving_context(config: BatchConfig, bundle: str | None):
             config.source_candidates_per_rule,
         ),
         config.assembly,
+        data_end_at=data_end_at,
+        progress_callback=progress_callback,
     )
     rule_model = content_model = None
     fcn = {}
@@ -522,11 +575,20 @@ def _run_shard(
 _WORKER: dict[str, Any] = {}
 
 
-def _init_worker(config_fields: dict[str, Any], bundle: str | None, roots: dict[str, str]) -> None:
+def _init_worker(
+    config_fields: dict[str, Any], bundle: str | None, roots: dict[str, str],
+    data_end_at=None, status_path: str | None = None, batch_id: str | None = None,
+    run_id: str | None = None,
+) -> None:
     os.environ.update(roots)
     config = BatchConfig(**config_fields)
+    if data_end_at is not None:
+        os.environ["RECSYS_VNPT_DATA_END_AT"] = str(data_end_at)
+    else:
+        os.environ.pop("RECSYS_VNPT_DATA_END_AT", None)
     _WORKER["config"] = config
-    _WORKER["context"], _WORKER["member_ids"] = _serving_context(config, bundle)
+    log = BatchStatus(Path(status_path), batch_id, "inference", run_id).log if status_path and batch_id else None
+    _WORKER["context"], _WORKER["member_ids"] = _serving_context(config, bundle, data_end_at, log)
 
 
 def _worker_shard(directory: str, profile_ids: list[str], identity: dict[str, Any]) -> dict[str, Any]:
@@ -546,13 +608,14 @@ def _compute_shards(
     bundle_path: str | None,
     results: dict[int, dict[str, Any]],
     log,
+    data_end_at=None,
 ) -> list[tuple[int, BaseException]]:
     """One pass over ``pending``; returns the shards that failed for reasons a
     retry can fix. A contract failure (BatchError) is never retried."""
     failures: list[tuple[int, BaseException]] = []
     if config.workers == 1:
         try:
-            context, member_ids = _serving_context(config, bundle_path)
+            context, member_ids = _serving_context(config, bundle_path, data_end_at, log)
         except (BatchError, MemoryError):
             raise
         except Exception as error:
@@ -570,7 +633,7 @@ def _compute_shards(
         return failures
     roots = {
         name: os.environ[name]
-        for name in ("RECSYS_VNPT_SOURCE_ROOT", "RECSYS_VNPT_DATA_ROOT")
+        for name in ("RECSYS_VNPT_SOURCE_ROOT", "RECSYS_VNPT_DATA_ROOT", "RECSYS_VNPT_TEMPORAL_ROOT", "RECSYS_VNPT_DATA_END_AT")
         if name in os.environ
     }
     # Spawn, not fork: forking while another thread (the qualification memory
@@ -580,7 +643,12 @@ def _compute_shards(
         max_workers=min(config.workers, len(pending)),
         mp_context=multiprocessing.get_context("spawn"),
         initializer=_init_worker,
-        initargs=(asdict(config), bundle_path, roots),
+        initargs=(
+            asdict(config), bundle_path, roots, data_end_at,
+            str(getattr(getattr(log, "__self__", None), "path", "")) or None,
+            getattr(getattr(log, "__self__", None), "batch_id", None),
+            getattr(getattr(log, "__self__", None), "run_id", None),
+        ),
     ) as pool:
         futures = {
             pool.submit(_worker_shard, str(directory), ids, shard_identity): index
@@ -608,6 +676,7 @@ def run_shards(
     bundle: Path | None,
     reuse: bool,
     log=None,
+    data_end_at=None,
 ) -> list[dict[str, Any]]:
     """Compute every shard not already verified under ``shard_root``.
 
@@ -639,7 +708,7 @@ def run_shards(
     for attempt in range(config.shard_retries + 1):
         if not pending:
             break
-        failures = _compute_shards(config, pending, bundle_path, results, log)
+        failures = _compute_shards(config, pending, bundle_path, results, log, data_end_at)
         if not failures:
             break
         if attempt == config.shard_retries:
@@ -762,21 +831,44 @@ def _run(
     body,
     *,
     allow_already_done: bool = True,
+    run_id: str | None = None,
+    expected_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Lock, track status, and turn any failure into a coded BatchError."""
     _check_batch_id(batch_id)
-    work = config.root("work_root") / "batches" / batch_id / kind
-    status = BatchStatus(work / "status.json", batch_id, kind)
-    with BatchLock(config.root("work_root") / "locks", f"{kind}-{batch_id}"):
+    run_id = run_id or uuid.uuid4().hex
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
+        raise BatchError("CONFIG_INVALID", "run_id must contain only letters, digits, dot, underscore or hyphen")
+    base_work = config.root("work_root") / "batches" / batch_id / kind
+    work = base_work / "runs" / run_id if kind in {"retrain", "inference"} else base_work
+    status = BatchStatus(work / "status.json", batch_id, kind, run_id=run_id)
+    lock_key = f"{kind}-{batch_id}-{run_id}" if kind in {"retrain", "inference"} else f"{kind}-{batch_id}"
+    with BatchLock(config.root("work_root") / "locks", lock_key):
         previous = status.read()
+        if previous and expected_details:
+            recorded = previous.get("details", {})
+            for key, value in expected_details.items():
+                if key in recorded and recorded[key] != value:
+                    raise BatchError(
+                        "CONFIG_INVALID",
+                        f"run_id {run_id} was already used with a different {key}",
+                    )
         if allow_already_done and previous and previous["phase"] == status.phases[-1]:
             status.log("already_done", phase=previous["phase"])
-            return {"status": "already_done", **previous["details"]}
+            return {"status": "already_done", "run_id": run_id, **previous["details"]}
         status.begin()
         try:
-            return body(work, status)
+            result = body(work, status)
+            result.setdefault("run_id", run_id)
+            if kind in {"retrain", "inference"}:
+                atomic_write_text(base_work / "status.json", json.dumps(status.read(), indent=2, sort_keys=True))
+                atomic_write_text(base_work / "latest_run.json", json.dumps({"run_id": run_id}, sort_keys=True))
+            return result
         except BatchError as error:
             status.fail(error)
+            if kind in {"retrain", "inference"}:
+                atomic_write_text(base_work / "status.json", json.dumps(status.read(), indent=2, sort_keys=True))
+                atomic_write_text(base_work / "latest_run.json", json.dumps({"run_id": run_id}, sort_keys=True))
             raise
         except Exception as error:
             code = PHASE_ERROR_CODES.get(status.phase or "", "INFERENCE_FAILED")
@@ -784,10 +876,24 @@ def _run(
                 code = "CAPACITY"
             wrapped = BatchError(code, f"{type(error).__name__}: {error}")
             status.fail(wrapped)
+            if kind in {"retrain", "inference"}:
+                atomic_write_text(base_work / "status.json", json.dumps(status.read(), indent=2, sort_keys=True))
+                atomic_write_text(base_work / "latest_run.json", json.dumps({"run_id": run_id}, sort_keys=True))
             raise wrapped from error
 
 
-def run_inference_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
+def run_inference_batch(
+    config: BatchConfig,
+    batch_id: str,
+    data_end_at: str | None = None,
+    *,
+    run_id: str | None = None,
+    model_path: str | Path | None = None,
+) -> dict[str, Any]:
+    from recsys_vnpt.canonical import normalize_data_end_at
+
+    cutoff = normalize_data_end_at(data_end_at) if data_end_at is not None else None
+
     def body(work: Path, status: BatchStatus) -> dict[str, Any]:
         timings: dict[str, float] = {}
         started = time.perf_counter()
@@ -799,12 +905,14 @@ def run_inference_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
             current = read_current_delivery(delivery)
         except (OSError, ValueError, KeyError) as error:
             raise BatchError("PUBLISH_FAILED", f"current delivery is unreadable: {error}") from error
-        if current and current["batch_id"] == batch_id:
-            # Committed by an earlier attempt that died before recording it.
-            status.transition("PUBLISHED", generation=current["generation"])
-            return {"status": "already_published", "generation": current["generation"]}
+        if current and current.get("run_id") == status.run_id:
+            if current.get("data_end_at") != (cutoff.isoformat() if cutoff is not None else None):
+                raise BatchError("CONFIG_INVALID", "run_id was already published with a different data_end_at")
+            status.transition("PUBLISHED", generation=current["generation"], recovered=True)
+            return {"status": "already_published", "run_id": status.run_id,
+                    "generation": current["generation"], "files": current.get("files", {})}
         current_batch_started_at = batch_started_at_from_metadata(current) if current else None
-        if current_batch_started_at and current_batch_started_at >= manifest.batch_started_at:
+        if current and current.get("batch_id") != batch_id and current_batch_started_at and current_batch_started_at >= manifest.batch_started_at:
             raise BatchError(
                 "INPUT_INTEGRITY",
                 f"batch_started_at {manifest.batch_started_at.isoformat()} does not advance past the "
@@ -823,10 +931,29 @@ def run_inference_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
             artifact_key=prepared.manifest["artifact_key"],
         )
 
-        with _roots(config.root("incoming_root") / batch_id, data_root):
-            status.transition("LOADING_MODEL")
-            bundle, bundle_info = _promoted(config)
-            profile_ids = sample_profiles(_profile_ids(config.domain), config.max_profiles)
+        with _roots(config.root("incoming_root") / batch_id, data_root, data_end_at=cutoff):
+            normalized_model_path = (
+                str(Path(model_path).expanduser().resolve()) if model_path is not None else None
+            )
+            status.transition(
+                "LOADING_MODEL",
+                data_end_at=cutoff.isoformat() if cutoff is not None else None,
+                requested_model_path=normalized_model_path,
+                model_source="explicit" if model_path is not None else "promoted",
+            )
+            bundle, bundle_info = _promoted(config, model_path=model_path)
+            if cutoff is not None:
+                trained_value = bundle_info.get("model_data_end_at") or bundle_info.get("model_serving_cutoff")
+                trained_through = pd.Timestamp(trained_value) if trained_value else None
+                if trained_through is not None and trained_through.tzinfo is not None:
+                    trained_through = trained_through.tz_localize(None)
+                if trained_through is not None and trained_through > cutoff:
+                    raise BatchError(
+                        "MODEL_UNAVAILABLE",
+                        f"selected model was trained through {trained_through}; it contains data after "
+                        f"the requested inference cutoff {cutoff}",
+                    )
+            profile_ids = sample_profiles(_profile_ids(config.domain, cutoff, status.log), config.max_profiles)
             status.transition(
                 "RUNNING_SHARDS",
                 profiles=len(profile_ids),
@@ -840,13 +967,17 @@ def run_inference_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
                 "model_sha256": bundle_info["model_sha256"],
                 "page_fingerprint": config.page_fingerprint(),
                 "code_version": code_version(),
+                "data_end_at": cutoff.isoformat() if cutoff is not None else None,
             }
-            shards = run_shards(config, profile_ids, work / "shards", identity, bundle, True, status.log)
+            shards = run_shards(
+                config, profile_ids, work / "shards", identity, bundle, True,
+                status.log, data_end_at=cutoff,
+            )
             timings["shards_seconds"] = time.perf_counter() - stage_started
 
         status.transition("MERGING")
         stage_started = time.perf_counter()
-        generation = f"{batch_id}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+        generation = f"{batch_id}_{status.run_id}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
         stage = delivery / "generations" / f".{generation}.stage"
         try:
             names = production_output_names(config.domain, manifest.batch_started_at.strftime("%Y%m%d"))
@@ -875,6 +1006,8 @@ def run_inference_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
                     "input_fingerprint": manifest.fingerprint,
                     "batch_started_at": manifest.batch_started_at.isoformat(),
                     "serving_cutoff": shards[0]["serving_cutoff"] if shards else None,
+                    "data_end_at": cutoff.isoformat() if cutoff is not None else None,
+                    "run_id": status.run_id,
                     "profiles": len(profile_ids),
                     "page_fingerprint": config.page_fingerprint(),
                     "code_version": identity["code_version"],
@@ -887,6 +1020,9 @@ def run_inference_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
         timings["total_seconds"] = time.perf_counter() - started
         report = {
             "status": "published",
+            "run_id": status.run_id,
+            "data_end_at": cutoff.isoformat() if cutoff is not None else None,
+            "serving_cutoff": shards[0]["serving_cutoff"] if shards else None,
             "generation": generation,
             "files": snapshot["files"],
             "profiles": len(profile_ids),
@@ -901,7 +1037,13 @@ def run_inference_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
         status.transition("PUBLISHED", generation=generation, sla_met=report["sla_met"])
         return report
 
-    return _run(config, batch_id, "inference", body)
+    return _run(
+        config, batch_id, "inference", body, run_id=run_id,
+        expected_details={
+            "data_end_at": cutoff.isoformat() if cutoff is not None else None,
+            "requested_model_path": str(Path(model_path).expanduser().resolve()) if model_path is not None else None,
+        },
+    )
 
 
 def _set_environment(values: dict[str, str]) -> None:
@@ -918,7 +1060,7 @@ def _evaluate(config: BatchConfig, bundle: Path | None = None) -> dict[str, Any]
     """
     roots = {
         name: os.environ[name]
-        for name in ("RECSYS_VNPT_SOURCE_ROOT", "RECSYS_VNPT_DATA_ROOT")
+        for name in ("RECSYS_VNPT_SOURCE_ROOT", "RECSYS_VNPT_DATA_ROOT", "RECSYS_VNPT_TEMPORAL_ROOT", "RECSYS_VNPT_DATA_END_AT")
         if name in os.environ
     }
     with ProcessPoolExecutor(
@@ -1030,11 +1172,22 @@ def retrain_gate(
     }
 
 
-def run_retrain_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
+def run_retrain_batch(
+    config: BatchConfig,
+    batch_id: str,
+    data_end_at: str | None = None,
+    *,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    from recsys_vnpt.canonical import normalize_data_end_at
+    from recsys_vnpt.source_manifest import stable_hash
+
     from recsys_vnpt.content_scorer import train_content_scorer
     from recsys_vnpt.orderings import fit_fcn
     from recsys_vnpt.rule_scorer import train_rule_scorer
     from recsys_vnpt.serving import _interactions_loader
+
+    data_end = normalize_data_end_at(data_end_at) if data_end_at is not None else None
 
     def body(work: Path, status: BatchStatus) -> dict[str, Any]:
         started = time.perf_counter()
@@ -1050,14 +1203,50 @@ def run_retrain_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
             artifact_key=prepared.manifest["artifact_key"],
         )
 
-        with _roots(config.root("incoming_root") / batch_id, data_root):
-            status.transition("TRAINING")
+        temporal_root = None
+        if data_end is not None:
+            temporal_key = stable_hash({
+                "input_fingerprint": manifest.fingerprint,
+                "data_end_at": data_end.isoformat(),
+                "domain": config.domain,
+                "time_train": config.time_train,
+                "time_valid": config.time_valid,
+                "time_test": config.time_test,
+            })
+            temporal_root = config.root("work_root") / "temporal" / temporal_key
+
+        with _roots(config.root("incoming_root") / batch_id, data_root, temporal_root, data_end):
             canonical = data_artifact_path("canonical", config.domain, project_root=PROJECT_ROOT)
-            loader = _interactions_loader(canonical)
+            status.transition("TRAINING", data_end_at=data_end.isoformat() if data_end is not None else None)
+            loader = _interactions_loader(canonical, data_end, status.log)
+            if data_end is not None:
+                from recsys_vnpt.pipeline_v2 import build_temporal_project
+
+                status.log("manual_temporal_build", status="started", data_end_at=data_end.isoformat(),
+                           temporal_cache=str(temporal_root))
+                temporal_lock = stable_hash(str(temporal_root))[:16]
+                with _waiting_lock(
+                    config.root("work_root") / "locks",
+                    f"temporal-{temporal_lock}",
+                    config.input_wait_seconds,
+                    config.poll_seconds,
+                ):
+                    build_temporal_project(
+                        PROJECT_ROOT,
+                        config.domain,
+                        window_mode="relative",
+                        time_train=config.time_train,
+                        time_valid=config.time_valid,
+                        time_test=config.time_test,
+                        data_end_at=data_end,
+                        temporal_root=temporal_root,
+                        progress_callback=status.log,
+                    )
+                status.log("manual_temporal_build", status="completed", temporal_cache=str(temporal_root))
             contents = pd.read_parquet(canonical / "contents.parquet", columns=["content_id"])
             # The serving cutoff of this data, computed as the serving context
             # does, so the category levels match what inference will see.
-            cutoff = pd.to_datetime(
+            serving_cutoff = pd.to_datetime(
                 loader(set(contents["content_id"].astype(str)), ["create_date"])["create_date"],
                 errors="coerce",
             ).max()
@@ -1069,7 +1258,7 @@ def run_retrain_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
                 status.log("scorer_training", scorer="rule", status="completed")
                 status.log("scorer_training", scorer="content", status="started")
                 content_model = train_content_scorer(
-                    canonical, pd.Timestamp(cutoff), loader,
+                    canonical, pd.Timestamp(serving_cutoff), loader,
                     backend=config.gbdt_backend, device=config.gbdt_device,
                 )
                 status.log("scorer_training", scorer="content", status="completed")
@@ -1092,7 +1281,8 @@ def run_retrain_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
                     "batch_id": batch_id,
                     "input_fingerprint": manifest.fingerprint,
                     "batch_started_at": manifest.batch_started_at.isoformat(),
-                    "serving_cutoff": str(cutoff),
+                    "data_end_at": data_end.isoformat() if data_end is not None else None,
+                    "serving_cutoff": str(serving_cutoff),
                     "code_version": code_version(),
                     "ordering": asdict(config.ordering),
                 },
@@ -1132,7 +1322,10 @@ def run_retrain_batch(config: BatchConfig, batch_id: str) -> dict[str, Any]:
         status.transition("PROMOTED", bundle=str(bundle))
         return report
 
-    return _run(config, batch_id, "retrain", body)
+    return _run(
+        config, batch_id, "retrain", body, run_id=run_id,
+        expected_details={"data_end_at": data_end.isoformat() if data_end is not None else None},
+    )
 
 
 class _PeakMemory:

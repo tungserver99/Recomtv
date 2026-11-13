@@ -73,7 +73,7 @@ def prepared_dataset_paths(config: BatchConfig, input_manifest: ReadyManifest) -
 
 
 def _required_artifacts(artifact_root: Path, domain: str) -> list[Path]:
-    canonical = artifact_root / "data" / "data" / "canonical" / domain
+    canonical = artifact_root / "canonical" / domain
     temporal = canonical / "temporal"
     return [
         canonical / "users.parquet",
@@ -93,19 +93,23 @@ def _required_artifacts(artifact_root: Path, domain: str) -> list[Path]:
     ]
 
 
-def _artifact_inventory(artifact_root: Path) -> list[dict[str, Any]]:
+def _artifact_inventory(artifact_root: Path, domain: str) -> list[dict[str, Any]]:
+    # Metrics and run reports share the configured data root but can change
+    # during retraining/inference. Only canonical and temporal inputs belong
+    # to the immutable prepared-dataset inventory.
+    canonical_root = artifact_root / "canonical" / domain
     return [
         {
             "path": path.relative_to(artifact_root).as_posix(),
             "size_bytes": path.stat().st_size,
         }
-        for path in sorted(artifact_root.rglob("*"))
+        for path in sorted(canonical_root.rglob("*"))
         if path.is_file()
     ]
 
 
 def _has_playback_date_partitions(artifact_root: Path) -> bool:
-    canonical = artifact_root / "data" / "data" / "canonical"
+    canonical = artifact_root / "canonical"
     return any(
         canonical.glob("*/playback_events_by_date/event_date=*/part-*.parquet")
     )
@@ -151,13 +155,13 @@ def write_prepared_dataset_manifest(
                 "PREPARED_DATA_UNAVAILABLE",
                 "preparation did not produce playback event date partitions",
             )
-        windows_path = paths.artifact_root / "data" / "data" / "canonical" / config.domain / "temporal" / "windows.json"
+        windows_path = paths.artifact_root / "canonical" / config.domain / "temporal" / "windows.json"
         try:
             windows_payload = json.loads(windows_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise BatchError("PREPARED_DATA_UNAVAILABLE", f"cannot read temporal windows: {error}") from error
         payload["temporal_windows"] = windows_payload.get("windows", [])
-        payload["artifacts"] = _artifact_inventory(paths.artifact_root)
+        payload["artifacts"] = _artifact_inventory(paths.artifact_root, config.domain)
         input_root = (config.root("incoming_root") / input_manifest.batch_id).resolve()
         input_files = []
         for row in input_manifest.files:
@@ -259,6 +263,10 @@ def load_prepared_dataset(config: BatchConfig, input_manifest: ReadyManifest) ->
             relative = PurePosixPath(str(item["path"]))
             if relative.is_absolute() or ".." in relative.parts or "\\" in str(relative):
                 raise ValueError("unsafe artifact path")
+            # Older manifests included every file under artifact_root, including
+            # mutable metrics pointers updated by retrain and inference.
+            if relative.parts[:2] != ("canonical", config.domain):
+                continue
             artifact = (artifact_root / Path(*relative.parts)).resolve(strict=True)
             if artifact_root not in artifact.parents or not artifact.is_file():
                 raise ValueError("artifact is not a regular file inside the dataset")
@@ -272,7 +280,7 @@ def load_prepared_dataset(config: BatchConfig, input_manifest: ReadyManifest) ->
         raise _unavailable(config, input_manifest.batch_id, f"prepared dataset is missing required artifacts: {missing[:5]}")
     if not _has_playback_date_partitions(artifact_root):
         raise _unavailable(config, input_manifest.batch_id, "prepared dataset is missing playback event date partitions")
-    windows_path = artifact_root / "data" / "data" / "canonical" / config.domain / "temporal" / "windows.json"
+    windows_path = artifact_root / "canonical" / config.domain / "temporal" / "windows.json"
     try:
         windows_payload = json.loads(windows_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:

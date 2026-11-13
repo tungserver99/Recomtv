@@ -66,7 +66,7 @@ def _manifest(config, batch_id="b1"):
 
 
 def _materialize_prepared_tree(paths, domain="all"):
-    canonical = paths.artifact_root / "data" / "data" / "canonical" / domain
+    canonical = paths.artifact_root / "canonical" / domain
     temporal = canonical / "temporal"
     temporal.mkdir(parents=True)
     (canonical / "users.parquet").write_bytes(b"users")
@@ -121,11 +121,33 @@ def test_prepared_dataset_rejects_missing_or_changed_artifacts(tmp_path):
     paths = prepared_dataset_paths(config, manifest)
     _materialize_prepared_tree(paths, config.domain)
     write_prepared_dataset_manifest(config, manifest, status="READY")
-    (paths.artifact_root / "data" / "data" / "canonical" / "all" / "users.parquet").write_bytes(b"tampered")
+    (paths.artifact_root / "canonical" / "all" / "users.parquet").write_bytes(b"tampered")
 
     with pytest.raises(BatchError, match="artifact") as error:
         load_prepared_dataset(config, manifest)
     assert error.value.code == "PREPARED_DATA_UNAVAILABLE"
+
+
+def test_retrain_metrics_pointer_changes_do_not_invalidate_prepared_data(tmp_path):
+    config = _config(tmp_path)
+    manifest = _manifest(config)
+    paths = prepared_dataset_paths(config, manifest)
+    _materialize_prepared_tree(paths, config.domain)
+    metrics = paths.artifact_root / "metrics" / "latest.json"
+    metrics.parent.mkdir(parents=True)
+    metrics.write_text('{"phase":"prepare"}', encoding="utf-8")
+    manifest_path = write_prepared_dataset_manifest(config, manifest, status="READY")
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["artifacts"].append({
+        "path": "metrics/latest.json",
+        "size_bytes": metrics.stat().st_size,
+    })
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    metrics.write_text('{"phase":"retrain","run_id":"a-new-run-with-longer-metadata"}', encoding="utf-8")
+
+    dataset = load_prepared_dataset(config, manifest)
+    assert dataset.artifact_root == paths.artifact_root
 
 
 def test_prepared_dataset_rejects_changed_raw_input(tmp_path):

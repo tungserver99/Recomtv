@@ -482,6 +482,91 @@ def read_partitioned_interactions(
     )
 
 
+def normalize_data_end_at(value: str | pd.Timestamp | None) -> pd.Timestamp | None:
+    """Parse an ISO cutoff and retain the source's local wall-clock time."""
+    if value is None:
+        return None
+    try:
+        cutoff = pd.Timestamp(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("data_end_at must be an ISO timestamp with a timezone offset") from error
+    if pd.isna(cutoff):
+        raise ValueError("data_end_at must be an ISO timestamp with a timezone offset")
+    if cutoff.tzinfo is None and isinstance(value, pd.Timestamp):
+        return cutoff
+    if cutoff.tzinfo is None:
+        raise ValueError("data_end_at must be an ISO timestamp with a timezone offset")
+    # Canonical timestamps are naive local wall-clock values; the ISO offset
+    # specifies their timezone and is stripped only after validation.
+    return cutoff.tz_localize(None)
+
+
+def interaction_partitions_through(
+    output_dir: str | Path, end: str | pd.Timestamp
+) -> tuple[list[Path], int]:
+    """Return only complete date partitions through the local cutoff day."""
+    cutoff = normalize_data_end_at(end)
+    assert cutoff is not None
+    root = Path(output_dir)
+    available = sorted(root.glob("event_date=*/part-*.parquet"))
+    selected = []
+    for path in available:
+        try:
+            partition_date = pd.Timestamp(path.parent.name.split("=", 1)[1]).date()
+        except (ValueError, IndexError):
+            continue
+        if partition_date <= cutoff.date():
+            selected.append(path)
+    return selected, len(available)
+
+
+def read_partitioned_interactions_until(
+    output_dir: str | Path,
+    end: str | pd.Timestamp,
+    *,
+    content_ids: set[str] | None = None,
+    columns: list[str] | None = None,
+    progress_callback=None,
+) -> pd.DataFrame:
+    """Prune later date partitions and push the exact timestamp filter to Polars."""
+    cutoff = normalize_data_end_at(end)
+    assert cutoff is not None
+    selected, available_count = interaction_partitions_through(output_dir, cutoff)
+    if progress_callback:
+        progress_callback(
+            "interaction_partition_read", cutoff=cutoff.isoformat(),
+            partitions_selected=len(selected), partitions_available=available_count,
+        )
+    if not selected:
+        return pd.DataFrame(columns=columns)
+
+    import polars as pl
+
+    scan = pl.scan_parquet([str(path) for path in selected])
+    available = set(scan.collect_schema().names())
+    if "create_date" not in available:
+        raise ValueError("partitioned interactions are missing create_date")
+    scan = scan.filter(pl.col("create_date") <= pl.lit(cutoff.to_pydatetime()))
+    if content_ids is not None and "content_id" in available:
+        scan = scan.filter(
+            pl.col("content_id").cast(pl.String).is_in(sorted(map(str, content_ids)))
+        )
+    output_columns = (
+        [column for column in columns if column in available]
+        if columns is not None else sorted(available)
+    )
+    frame = scan.select(output_columns).collect(engine="streaming").to_pandas()
+    if "create_date" in frame:
+        frame["create_date"] = pd.to_datetime(frame["create_date"], errors="coerce")
+    if progress_callback:
+        progress_callback(
+            "interaction_partition_read", cutoff=cutoff.isoformat(),
+            partitions_selected=len(selected), partitions_available=available_count,
+            rows_read=len(frame),
+        )
+    return frame.reset_index(drop=True)
+
+
 def read_partitioned_events(
     output_dir: str | Path,
     start: str | pd.Timestamp,

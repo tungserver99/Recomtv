@@ -67,10 +67,11 @@ def _now() -> str:
 class BatchStatus:
     """Forward-only phase tracking for one run of one batch."""
 
-    def __init__(self, path: Path, batch_id: str, kind: str):
+    def __init__(self, path: Path, batch_id: str, kind: str, run_id: str | None = None):
         self.path = Path(path)
         self.batch_id = batch_id
         self.kind = kind
+        self.run_id = run_id
         self.phases = PHASES[kind]
         self.log_path = self.path.with_name("log.jsonl")
 
@@ -89,6 +90,7 @@ class BatchStatus:
                 "schema_version": 1,
                 "batch_id": self.batch_id,
                 "kind": self.kind,
+                "run_id": self.run_id,
                 "attempt": int(previous.get("attempt", 0)) + 1,
                 "phase": self.phases[0],
                 "history": [{"phase": self.phases[0], "at": _now()}],
@@ -132,7 +134,8 @@ class BatchStatus:
 
     def log(self, event: str, **fields: Any) -> None:
         line = json.dumps(
-            {"at": _now(), "batch_id": self.batch_id, "kind": self.kind, "event": event, **fields},
+            {"at": _now(), "batch_id": self.batch_id, "kind": self.kind,
+             **({"run_id": self.run_id} if self.run_id else {}), "event": event, **fields},
             default=str,
         )
         self.log_path.parent.mkdir(parents=True, exist_ok=True)

@@ -17,6 +17,9 @@ from recsys_vnpt.engagement import (
     DEFAULT_TARGET_VERSION,
     GAIN_COLUMNS,
     LabelContract,
+    apply_atomic_duration,
+    build_playback_events,
+    fit_label_contract,
     historical_sequence_features,
     label_engagement_window,
 )
@@ -70,6 +73,7 @@ from recsys_vnpt.prepare import (  # re-exported: callers still import these her
     build_rule_membership_from_ids,
     prepare_canonical_project,
 )
+from recsys_vnpt.canonical import normalize_data_end_at
 
 from recsys_vnpt.runtime import (
     _partition_serving_interaction_scopes,
@@ -94,12 +98,16 @@ def build_temporal_project(
     time_test: int = 24,
     impression_weight: float = 1.0,
     progress_callback: Callable[..., None] | None = None,
+    data_end_at: str | pd.Timestamp | None = None,
+    temporal_root: str | Path | None = None,
 ) -> dict[str, Path]:
     temporal_build_started = time.perf_counter()
     if progress_callback:
         progress_callback("temporal_stage", stage="load_canonical", status="started")
     root = Path(project_root).resolve()
     canonical = data_artifact_path("canonical", domain, project_root=root)
+    cutoff = normalize_data_end_at(data_end_at) if data_end_at is not None else None
+    temporal = Path(temporal_root) if temporal_root is not None else canonical / "temporal"
     if target_version != DEFAULT_TARGET_VERSION:
         raise ValueError(
             "legacy binary targets are audit-only; build promotion data with "
@@ -114,7 +122,12 @@ def build_temporal_project(
     interactions = _read_canonical_interactions(
         canonical / "interactions.parquet",
         content_ids=set(items["content_id"].astype(str)),
+        data_end_at=cutoff,
+        progress_callback=progress_callback,
     )
+    if cutoff is not None and "profile_id" in interactions:
+        profiles_at_cutoff = set(interactions["profile_id"].dropna().astype(str))
+        mapping = mapping[mapping["profile_id"].astype(str).isin(profiles_at_cutoff)].copy()
     playback_events_path = canonical / "playback_events.parquet"
     label_contract_path = canonical / "label_contract_v4.json"
     if not playback_events_path.exists() or not label_contract_path.exists():
@@ -122,8 +135,26 @@ def build_temporal_project(
             "Missing engagement v4 artifacts. Re-run pipeline prepare before "
             "building temporal data."
         )
-    playback_events = pd.read_parquet(playback_events_path)
-    label_contract = LabelContract.load(label_contract_path)
+    if cutoff is None:
+        playback_events = pd.read_parquet(playback_events_path)
+        label_contract = LabelContract.load(label_contract_path)
+    else:
+        playback_events, _, playback_metrics = build_playback_events(interactions)
+        max_event = pd.to_datetime(playback_events.get("event_end"), errors="coerce").max()
+        if pd.isna(max_event):
+            raise ValueError(f"no playback events exist at or before data_end_at={cutoff}")
+        fit_cutoff = (
+            max_event.normalize() - pd.Timedelta(days=20)
+            + pd.offsets.Day(1) - pd.Timedelta(1, unit="ns")
+        )
+        label_contract = fit_label_contract(items, playback_events, domain, fit_cutoff)
+        items = apply_atomic_duration(items, label_contract)
+        if progress_callback:
+            progress_callback(
+                "manual_label_contract", data_end_at=cutoff.isoformat(),
+                label_fit_cutoff=str(fit_cutoff), playback_events=len(playback_events),
+                playback_metrics=playback_metrics,
+            )
     if label_contract.domain != domain:
         raise ValueError(
             f"label contract domain mismatch: {label_contract.domain} != {domain}"
@@ -172,7 +203,7 @@ def build_temporal_project(
             read_partitioned_events(
                 playback_partitions, window.label_start, window.label_end
             )
-            if playback_partitions.is_dir()
+            if cutoff is None and playback_partitions.is_dir()
             else playback_events[
                 pd.to_datetime(playback_events["event_end"], errors="coerce").between(
                     window.label_start, window.label_end
@@ -205,8 +236,8 @@ def build_temporal_project(
         window.name: label_future_window(interactions, items, window, domain)
         for window in temporal_windows
     }
-    label_metrics_path = canonical / "label_metrics.json"
-    label_metrics = (
+    label_metrics_path = (temporal / "label_metrics.json") if cutoff is not None else canonical / "label_metrics.json"
+    label_metrics = ({ } if cutoff is not None else
         json.loads(label_metrics_path.read_text(encoding="utf-8"))
         if label_metrics_path.exists()
         else {}
@@ -281,9 +312,8 @@ def build_temporal_project(
             "label_sensitivity": label_sensitivity,
         }
     )
-    label_metrics_path.write_text(
-        json.dumps(label_metrics, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    label_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    label_metrics_path.write_text(json.dumps(label_metrics, indent=2, sort_keys=True), encoding="utf-8")
     selected_profiles = select_smoke_profile_cohort(
         labeled_windows, max_profiles, seed=seed
     )
@@ -319,7 +349,6 @@ def build_temporal_project(
         name: frame[frame["content_id"].astype(str).isin(selected_contents)]
         for name, frame in labeled_windows.items()
     }
-    temporal = canonical / "temporal"
     temporal.mkdir(parents=True, exist_ok=True)
     time_config = {
         "mode": window_mode,

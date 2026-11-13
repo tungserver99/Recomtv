@@ -226,6 +226,50 @@ def _render_pipeline(st, steps: list[dict[str, Any]]) -> None:
         right.markdown(_status_badge(step["status"]))
 
 
+def _latest_action_status(batch_root: Path, kind: str) -> dict[str, Any] | None:
+    paths = sorted((batch_root / kind / "runs").glob("*/status.json"), key=lambda p: p.stat().st_mtime)
+    return read_batch_status(paths[-1]) if paths else read_batch_status(batch_root / kind / "status.json")
+
+
+def _render_manual_action(st, store, prepared_job, slot, timezone: str, kind: str) -> None:
+    title = "Retrain" if kind == "retrain" else "Inference"
+    with st.form(f"{kind}_run_form"):
+        mode = st.radio(f"{title} data time", ["Automatic", "Manual"], horizontal=True, key=f"{kind}_mode")
+        selected_at = None
+        if mode == "Manual":
+            selected_at = st.datetime_input(
+                "Data end date/time",
+                value=datetime(2025, 2, 15, 23, 59, 59),
+                key=f"{kind}_data_end_at",
+            )
+        submitted = st.form_submit_button(
+            f"{title} · Run now", type="primary" if kind == "inference" else "secondary",
+            disabled=prepared_job is None,
+        )
+    if not submitted:
+        return
+    if prepared_job is None:
+        st.info("Run Prepare Data first.")
+        return
+    cutoff = None
+    if selected_at is not None:
+        from zoneinfo import ZoneInfo
+
+        cutoff = selected_at.replace(tzinfo=ZoneInfo(timezone)).isoformat()
+    batch_id = prepared_job["report"].get("batch_id", prepared_job["batch_id"])
+    try:
+        request_id = store.enqueue_request(
+            slot, kind=kind, batch_id=batch_id, data_end_at=cutoff
+        )
+    except ValueError as error:
+        st.warning(str(error))
+    else:
+        st.success(
+            f"{title} queued · run_id `{request_id}` · batch `{batch_id}` · "
+            f"{mode}{f' · data_end_at {cutoff}' if cutoff else ''}."
+        )
+
+
 def _render_demo(st) -> None:
     st.warning("DEMO MODE · Nội dung bên dưới là dữ liệu mô phỏng, không đọc hoặc ghi trạng thái production.")
     jobs = demo_jobs()
@@ -279,6 +323,21 @@ def _render_live_overview(st, config, store, schedule) -> None:
     cards[2].metric("Latest batch started", job.get("batch_started_at", "—") if job else "—")
     cards[3].metric("Current status", job["status"] if job else "IDLE")
     cards[4].metric("Prepared data", preparation_state)
+    queued = store.queued_requests() if hasattr(store, "queued_requests") else []
+    if queued:
+        st.subheader("Queued operations")
+        st.dataframe(
+            [{
+                "Job": item["kind"].title(),
+                "Status": item["status"],
+                "run_id": item["request_id"],
+                "Batch ID": item["batch_id"],
+                "Mode": "Manual" if item.get("data_end_at") else "Automatic",
+                "data_end_at": item.get("data_end_at"),
+            } for item in queued],
+            use_container_width=True,
+            hide_index=True,
+        )
     try:
         from recsys_vnpt.scorer_bundle import promoted_bundle
 
@@ -297,76 +356,84 @@ def _render_live_overview(st, config, store, schedule) -> None:
             f"{duration_text}"
         )
     if job:
-        st.subheader("Current / Latest Pipeline")
-        batch_id = job["batch_id"]
+        st.subheader("Current / Latest Job")
+        batch_id = report.get("batch_id", job["batch_id"])
         batch_root = config.work_root / "batches" / batch_id
-        retrain_status = read_batch_status(batch_root / "retrain" / "status.json")
-        inference_status = read_batch_status(batch_root / "inference" / "status.json")
-        _render_pipeline(st, build_pipeline_steps(report, retrain_status, inference_status))
-        st.subheader("All job steps and logs")
-        st.caption("All recorded entries are shown here; this panel updates every 5 seconds.")
-        log_paths = {
-            "Production orchestration": batch_root / "production" / "log.jsonl",
-            "Data preparation": batch_root / "prepare" / "log.jsonl",
-            "Retraining": batch_root / "retrain" / "log.jsonl",
-            "Inference and publishing": batch_root / "inference" / "log.jsonl",
-        }
-        for label, log_path in log_paths.items():
-            log_text = live_log_text(log_path)
-            with st.expander(label, expanded=(label != "Inference and publishing")):
-                if log_text:
-                    st.code(log_text, language="json")
-                else:
-                    st.caption("No log entries yet.")
-        if report.get("status") == "SUCCESS":
+        kind = report.get("kind")
+        if kind in {"retrain", "inference"}:
+            run_id = report.get("run_id")
+            run_root = batch_root / kind / "runs" / str(run_id)
+            status = read_batch_status(run_root / "status.json")
+            cols = st.columns(4)
+            cols[0].metric("Job", kind.title())
+            cols[1].metric("Status", (status or {}).get("phase", report.get("status", "UNKNOWN")))
+            cols[2].metric("Mode", report.get("mode", "Automatic"))
+            cols[3].metric("Run time", report.get("duration_seconds", "Running"))
+            st.caption(
+                f"run_id `{run_id}` · batch `{batch_id}` · "
+                f"data_end_at `{report.get('data_end_at') or 'latest available'}` · "
+                f"serving_cutoff `{report.get('serving_cutoff') or '—'}` · "
+                f"model `{report.get('model_bundle_id') or '—'}`"
+            )
+            if report.get("error_message"):
+                st.error(f"{report.get('error_code')}: {report['error_message']}")
+            if kind == "inference" and report.get("output_files"):
+                st.subheader("Published files")
+                output_root = Path(report.get("output_location", ""))
+                for name in report["output_files"]:
+                    path = output_root / name
+                    if path.is_file():
+                        st.download_button(f"Download {name}", path.read_bytes(), file_name=name)
+            with st.expander("Job status and log", expanded=True):
+                if status:
+                    st.json(status)
+                log_text = live_log_text(run_root / "log.jsonl")
+                st.code(log_text or "No log entries yet.", language="json")
+        else:
+            retrain_status = _latest_action_status(batch_root, "retrain")
+            inference_status = _latest_action_status(batch_root, "inference")
+            _render_pipeline(st, build_pipeline_steps(report, retrain_status, inference_status))
+            st.subheader("All job steps and logs")
+            st.caption("All recorded entries are shown here; this panel updates every 5 seconds.")
+            log_paths = {
+                "Production orchestration": batch_root / "production" / "log.jsonl",
+                "Data preparation": batch_root / "prepare" / "log.jsonl",
+                "Retraining": batch_root / "retrain" / "log.jsonl",
+                "Inference and publishing": batch_root / "inference" / "log.jsonl",
+            }
+            for label, log_path in log_paths.items():
+                log_text = live_log_text(log_path)
+                with st.expander(label, expanded=(label != "Inference and publishing")):
+                    if log_text:
+                        st.code(log_text, language="json")
+                    else:
+                        st.caption("No log entries yet.")
+        if report.get("status") in {"SUCCESS", "COMPLETED"}:
             st.success(f"Job completed · model {report.get('model_used', 'unknown')} · {report.get('duration_seconds', 0):.1f}s")
         elif report.get("error_message"):
             st.error(f"{report.get('error_code')}: {report['error_message']}")
     else:
         st.info("No production runs recorded yet.")
     prepare_disabled = bool(current or prepared_for_next_slot)
-    prepare_column, run_column = st.columns(2)
-    with prepare_column:
-        if st.button("Prepare Data", disabled=prepare_disabled):
-            try:
-                request_id = store.enqueue_request(next_slot, kind="prepare")
-            except ValueError as error:
-                st.warning(str(error))
-            else:
-                st.success(
-                    f"Prepare request queued ({request_id[:8]}) for next slot "
-                    f"{batch_id_for_slot(next_slot)}."
-                )
-        if prepared_for_next_slot:
-            st.caption("The next scheduled slot already has prepared data.")
-        elif current:
-            st.caption("Wait for the current job to finish before preparing another batch.")
-    with run_column:
-        run_clicked = st.button("Run now", type="primary", disabled=bool(current or not prepared_job))
-        if run_clicked and prepared_job:
-            slot = datetime.fromisoformat(prepared_job["scheduled_at"])
-            batch_id = prepared_job["batch_id"]
-            existing = next((item for item in jobs if item["batch_id"] == batch_id and item["status"] == "SUCCESS"), None)
-            try:
-                from recsys_vnpt.export import read_current_delivery
-
-                delivery = read_current_delivery(config.delivery_root)
-            except Exception as error:
-                delivery = None
-                st.error(f"Could not verify the current delivery: {error}")
-            if delivery and delivery.get("batch_id") == batch_id:
-                st.warning(f"Scheduled slot {batch_id} has already been published.")
-            elif existing:
-                st.warning(f"Scheduled slot {batch_id} has already completed.")
-            else:
-                try:
-                    request_id = store.enqueue_request(slot, kind="production")
-                except ValueError as error:
-                    st.warning(str(error))
-                else:
-                    st.success(f"Run request queued ({request_id[:8]}) for prepared batch {batch_id}.")
-        if not prepared_job:
-            st.info("Prepare Data first. Retrain and inference only run against a prepared dataset.")
+    if st.button("Prepare Data · Run now", disabled=prepare_disabled):
+        try:
+            request_id = store.enqueue_request(next_slot, kind="prepare")
+        except ValueError as error:
+            st.warning(str(error))
+        else:
+            st.success(f"Prepare Data queued · run_id `{request_id}` for `{batch_id_for_slot(next_slot)}`.")
+    if prepared_for_next_slot:
+        st.caption("The next scheduled slot already has prepared data.")
+    elif current:
+        st.caption("Wait for the current job to finish before queuing another operation.")
+    st.divider()
+    if not prepared_job:
+        st.info("Prepare Data first. Retrain and Inference only use an existing Prepared Dataset.")
+    retrain_column, inference_column = st.columns(2)
+    with retrain_column:
+        _render_manual_action(st, store, prepared_job, next_slot, schedule["timezone"], "retrain")
+    with inference_column:
+        _render_manual_action(st, store, prepared_job, next_slot, schedule["timezone"], "inference")
 
 
 def main() -> None:
@@ -421,16 +488,22 @@ def main() -> None:
         st.caption("The raw folder is copied into an immutable batch snapshot before preparation.")
 
         st.subheader("Schedule configuration")
+        inference_times = schedule.get("inference_run_times", schedule.get("run_times", []))
+        retrain_times = schedule.get("retrain_run_times", [])
         with st.form("schedule_config"):
             enabled = st.toggle("Schedule enabled", value=bool(schedule["enabled"]))
             timezone = st.text_input("Timezone", value=schedule["timezone"])
-            times = list(schedule["run_times"])
-            first = st.text_input("Run time 1 (HH:MM)", value=times[0] if times else "00:00")
-            second = st.text_input("Run time 2 (HH:MM)", value=times[1] if len(times) > 1 else "12:00")
+            st.caption("Each schedule calls only its own job. Prepare Data remains manual.")
+            infer_first = st.text_input("Inference time 1 (HH:MM)", value=inference_times[0] if inference_times else "00:00")
+            infer_second = st.text_input("Inference time 2 (HH:MM)", value=inference_times[1] if len(inference_times) > 1 else "12:00")
+            retrain_first = st.text_input("Retrain time 1 (HH:MM; optional)", value=retrain_times[0] if retrain_times else "")
+            retrain_second = st.text_input("Retrain time 2 (HH:MM; optional)", value=retrain_times[1] if len(retrain_times) > 1 else "")
             submitted = st.form_submit_button("Save Configuration")
-        new_times = [first.strip(), second.strip()]
         try:
-            candidate = validate_schedule_form(timezone.strip(), new_times)
+            candidate = validate_schedule_form(timezone.strip(), [infer_first.strip(), infer_second.strip()])
+            retrain_values = [value.strip() for value in (retrain_first, retrain_second) if value.strip()]
+            candidate["retrain_run_times"] = list(validate_run_times(retrain_values)) if retrain_values else []
+            candidate["inference_run_times"] = candidate["run_times"]
             local_now = datetime.now(ZoneInfo(candidate["timezone"]))
             for run_time in candidate["run_times"]:
                 from datetime import timedelta
@@ -504,7 +577,13 @@ def main() -> None:
             report = item["report"]
             rows.append(
                 {
-                    "Batch ID": item["batch_id"],
+                    "Job": report.get("kind", "production").title(),
+                    "Batch ID": report.get("batch_id", item["batch_id"]),
+                    "run_id": report.get("run_id"),
+                    "Mode": report.get("mode"),
+                    "data_end_at": report.get("data_end_at"),
+                    "serving_cutoff": report.get("serving_cutoff"),
+                    "Status": item["status"],
                     "Scheduled time": item["scheduled_at"],
                     "Actual start": item["actual_start"],
                     "Batch started": item["batch_started_at"],
@@ -519,17 +598,40 @@ def main() -> None:
             )
         st.dataframe(rows, use_container_width=True, hide_index=True)
         if jobs:
-            selected_id = st.selectbox("Inspect job", [item["batch_id"] for item in jobs])
-            selected = next(item for item in jobs if item["batch_id"] == selected_id)
+            selected_key = st.selectbox(
+                "Inspect job",
+                [item["batch_id"] for item in jobs],
+                format_func=lambda key: next((
+                    f"{item['report'].get('kind', 'production')} · "
+                    f"{item['report'].get('batch_id', key)} · {item['report'].get('run_id', key)}"
+                    for item in jobs if item["batch_id"] == key
+                ), key),
+            )
+            selected = next(item for item in jobs if item["batch_id"] == selected_key)
             st.json(selected["report"])
-            batch_root = config.work_root / "batches" / selected_id
+            batch_id = selected["report"].get("batch_id", selected_key)
+            if selected["report"].get("kind") == "inference":
+                output_root = Path(selected["report"].get("output_location", ""))
+                for name in selected["report"].get("output_files", {}):
+                    output_path = output_root / name
+                    if output_path.is_file():
+                        st.download_button(
+                            f"Download {name}", output_path.read_bytes(), file_name=name,
+                            key=f"history-download-{selected_key}-{name}",
+                        )
+            batch_root = config.work_root / "batches" / batch_id
             st.subheader("Pipeline logs")
-            for kind in ("prepare", "retrain", "inference"):
-                status = read_batch_status(batch_root / kind / "status.json")
+            kind = selected["report"].get("kind")
+            run_id = selected["report"].get("run_id")
+            kinds = [kind] if kind in {"retrain", "inference"} else ["prepare"]
+            for kind in kinds:
+                status_path = (batch_root / kind / "runs" / str(run_id) / "status.json") if run_id else (batch_root / kind / "status.json")
+                status = read_batch_status(status_path)
+                log_path = status_path.with_name("log.jsonl")
                 with st.expander(f"{kind.title()} status · {status.get('phase') if status else 'not started'}"):
                     if status:
                         st.json(status)
-                    st.dataframe(read_logs(batch_root / kind / "log.jsonl"), use_container_width=True, hide_index=True)
+                    st.dataframe(read_logs(log_path), use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":

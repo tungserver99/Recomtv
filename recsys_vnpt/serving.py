@@ -108,11 +108,13 @@ def _fallback_canonical_paths(root: Path, domain: str) -> tuple[Path, Path, Path
     return canonical / "contents.parquet", canonical / "content_rule_membership.parquet", canonical / "profile_mapping.parquet"
 
 
-def _interactions_loader(canonical: Path):
+def _interactions_loader(canonical: Path, data_end_at=None, progress_callback=None):
     return lambda content_ids, columns: _read_canonical_interactions(
         canonical / "interactions.parquet",
         content_ids=content_ids,
         columns=columns,
+        data_end_at=data_end_at,
+        progress_callback=progress_callback,
     )
 
 
@@ -174,6 +176,8 @@ def load_serving_context(
     retrieval_config: RetrievalConfig,
     assembly_config: RuleAssemblyConfig,
     num_contents: int | None = None,
+    data_end_at=None,
+    progress_callback=None,
 ) -> ServingContext:
     content_path, membership_path, profile_path = _fallback_canonical_paths(root, domain)
     if not all(path.exists() for path in (content_path, membership_path, profile_path)):
@@ -186,7 +190,12 @@ def load_serving_context(
     interactions = _read_canonical_interactions(
         canonical / "interactions.parquet",
         content_ids=set(contents["content_id"].astype(str)),
+        data_end_at=data_end_at,
+        progress_callback=progress_callback,
     )
+    if data_end_at is not None and "profile_id" in interactions:
+        available_profiles = set(interactions["profile_id"].dropna().astype(str))
+        profiles = profiles[profiles["profile_id"].astype(str).isin(available_profiles)].copy()
     users_path = canonical / "users.parquet"
     if not users_path.exists():
         raise FileNotFoundError(f"Missing {users_path}. Run pipeline_cli prepare first.")

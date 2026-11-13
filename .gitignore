@@ -21,6 +21,8 @@ month_mytv_info.parquet
 **/runs/
 .venv/
 .superpowers/
+/cloudflared
+/cloudflared.exe
 
 # Local pytest/runtime caches
 .pytest_cache/

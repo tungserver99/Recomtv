@@ -85,6 +85,24 @@ def test_prepare_and_production_requests_keep_distinct_actions_for_one_slot(tmp_
     assert run_id != prepare_id
 
 
+def test_independent_action_request_preserves_batch_and_manual_cutoff(tmp_path):
+    store = StateStore(tmp_path / "state.db")
+    slot = datetime.fromisoformat("2025-02-16T00:00:00+07:00")
+
+    request_id = store.enqueue_request(
+        slot,
+        kind="inference",
+        batch_id="data",
+        data_end_at="2025-02-16T23:59:59+07:00",
+    )
+    request = store.claim_next_request()
+
+    assert request["request_id"] == request_id
+    assert request["kind"] == "inference"
+    assert request["batch_id"] == "data"
+    assert request["data_end_at"] == "2025-02-16T23:59:59+07:00"
+
+
 def test_queued_request_of_another_kind_is_not_returned_as_this_action(tmp_path):
     store = StateStore(tmp_path / "state.db")
     first = datetime.fromisoformat("2026-11-13T12:00:00+07:00")

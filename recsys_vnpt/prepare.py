@@ -18,6 +18,8 @@ from typing import Any, Callable
 import pandas as pd
 
 from recsys_vnpt.canonical import (
+    normalize_data_end_at,
+    read_partitioned_interactions_until,
     ContentSnapshot,
     cache_fingerprint,
     cache_is_current,
@@ -548,8 +550,28 @@ def _read_canonical_interactions(
     path: Path,
     content_ids: set[str] | None = None,
     columns: list[str] | None = None,
+    data_end_at: str | pd.Timestamp | None = None,
+    progress_callback=None,
 ) -> pd.DataFrame:
     """Read a canonical file/dataset with lazy catalog filtering for full runs."""
+    if data_end_at is None:
+        configured_cutoff = os.environ.get("RECSYS_VNPT_DATA_END_AT")
+        data_end_at = pd.Timestamp(configured_cutoff) if configured_cutoff else None
+    if data_end_at is not None:
+        cutoff = normalize_data_end_at(data_end_at)
+        assert cutoff is not None
+        partitions = path.parent / "interactions_by_date"
+        if not partitions.is_dir():
+            raise FileNotFoundError(
+                f"Manual data_end_at requires interaction partitions at {partitions}; rerun Prepare Data"
+            )
+        return read_partitioned_interactions_until(
+            partitions,
+            cutoff,
+            content_ids=content_ids,
+            columns=columns,
+            progress_callback=progress_callback,
+        )
     if not path.exists():
         raise FileNotFoundError(f"Missing canonical interactions at {path}")
     if path.is_dir():

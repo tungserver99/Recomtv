@@ -19,6 +19,8 @@ class ProductionConfig:
     timezone: str
     schedule_enabled: bool
     run_times: tuple[str, ...]
+    retrain_run_times: tuple[str, ...]
+    inference_run_times: tuple[str, ...]
     data_root: Path
     batch_values: dict[str, Any]
 
@@ -109,6 +111,13 @@ def load_production_config(path: str | Path) -> ProductionConfig:
         run_times = validate_run_times(schedule.get("run_times"))
     except (TypeError, ValueError) as error:
         raise ValueError(str(error)) from error
+    try:
+        retrain_values = schedule.get("retrain_run_times", ())
+        retrain_run_times = validate_run_times(retrain_values) if retrain_values else ()
+        inference_values = schedule.get("inference_run_times", run_times)
+        inference_run_times = validate_run_times(inference_values) if inference_values else ()
+    except (TypeError, ValueError) as error:
+        raise ValueError(str(error)) from error
     configured_data_root = raw.get("data_root", raw.get("source_root"))
     if not isinstance(configured_data_root, str) or not configured_data_root.strip():
         raise ValueError("production config requires a non-empty data_root")
@@ -138,6 +147,8 @@ def load_production_config(path: str | Path) -> ProductionConfig:
         timezone=timezone,
         schedule_enabled=bool(schedule.get("enabled", False)),
         run_times=run_times,
+        retrain_run_times=retrain_run_times,
+        inference_run_times=inference_run_times,
         data_root=data_root,
         batch_values=resolved_batch,
     )

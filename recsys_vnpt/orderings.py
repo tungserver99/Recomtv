@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
+from recsys_vnpt.temporal import temporal_artifact_root
 
 
 RULE_ORDERINGS = ("count", "learned_rrf", "fcn", "segment")
@@ -248,7 +249,7 @@ def fit_fcn(
 
     frames = []
     for name in ("train_1", "train_2", "train_3", "validation"):
-        frame = pd.read_parquet(canonical / "temporal" / f"{name}.parquet")
+        frame = pd.read_parquet(temporal_artifact_root(canonical) / f"{name}.parquet")
         frame["temporal_window"] = name
         frames.append(frame)
     train, validation = pd.concat(frames, ignore_index=True), frames[-1]

@@ -1,6 +1,7 @@
 import sys
 import os
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -137,6 +138,22 @@ def test_main_overview_renders_without_local_cutoff_import_shadowing(monkeypatch
         def radio(self, label, options):
             return "Live" if label == "Mode" else "Overview"
 
+    class Form:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def radio(self, *args, **kwargs):
+            return "Automatic"
+
+        def datetime_input(self, *args, **kwargs):
+            return datetime(2025, 2, 15, 23, 59, 59)
+
+        def form_submit_button(self, *args, **kwargs):
+            return False
+
     fake_streamlit = SimpleNamespace(
         set_page_config=lambda **kwargs: None,
         fragment=fragment,
@@ -146,6 +163,10 @@ def test_main_overview_renders_without_local_cutoff_import_shadowing(monkeypatch
         caption=lambda *args, **kwargs: None,
         info=lambda *args, **kwargs: None,
         button=lambda *args, **kwargs: False,
+        divider=lambda: None,
+        radio=lambda *args, **kwargs: "Automatic",
+        form=lambda *args, **kwargs: Form(),
+        form_submit_button=lambda *args, **kwargs: False,
     )
     monkeypatch.setitem(sys.modules, "streamlit", fake_streamlit)
 

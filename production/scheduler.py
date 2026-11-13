@@ -12,7 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from production.config import load_production_config
-from production.orchestrator import run_production
+from production.orchestrator import run_batch_action, run_production
 from production.schedule import apply_schedule
 from production.state_store import StateStore
 from recsys_vnpt.batch_state import BatchLock
@@ -46,9 +46,12 @@ LOG = logging.getLogger("production.scheduler")
 
 
 def _default_schedule(config) -> dict:
+    inference_times = getattr(config, "inference_run_times", config.run_times)
     return {
         "enabled": config.schedule_enabled,
-        "run_times": list(config.run_times),
+        "run_times": list(inference_times),
+        "inference_run_times": list(inference_times),
+        "retrain_run_times": list(getattr(config, "retrain_run_times", ())),
         "timezone": config.timezone,
     }
 
@@ -59,12 +62,22 @@ def _run_manual(config, store, request):
     try:
         slot = resolve_slot(request["slot"], store.get_schedule(_default_schedule(config))["timezone"],
                            store.get_schedule(_default_schedule(config))["run_times"])
-        run_production(
-            config,
-            slot,
-            store=store,
-            prepare_only=request.get("kind", "production") == "prepare",
-        )
+        kind = request.get("kind", "production")
+        if kind in {"retrain", "inference"}:
+            run_batch_action(
+                config,
+                request["batch_id"],
+                kind,
+                store=store,
+                scheduled_at=slot,
+                data_end_at=request.get("data_end_at"),
+                run_id=request["request_id"],
+            )
+        else:
+            result = run_production(config, slot, store=store, prepare_only=kind == "prepare")
+            if kind == "prepare":
+                result.update({"kind": "prepare", "run_id": request["request_id"], "mode": "Automatic"})
+                store.update_job(result.get("batch_id", request["batch_id"]), result, result.get("status"))
         store.finish_request(request["request_id"])
     except Exception as error:
         LOG.exception("manual request %s failed", request["request_id"])
@@ -92,9 +105,10 @@ def _serve(config, store, scheduler_factory, poll_seconds: float) -> None:
     schedule = store.get_schedule(_default_schedule(config))
     scheduler = scheduler_factory(timezone=ZoneInfo(schedule["timezone"]))
 
-    def dispatch(run_time: str) -> None:
+    def dispatch(kind: str, run_time: str) -> None:
         current = store.get_schedule(_default_schedule(config))
-        if not current.get("enabled") or run_time not in current["run_times"]:
+        times = current.get(f"{kind}_run_times", current.get("run_times", []))
+        if not current.get("enabled") or run_time not in times:
             return
         zone = ZoneInfo(current["timezone"])
         now = datetime.now(zone)
@@ -103,11 +117,24 @@ def _serve(config, store, scheduler_factory, poll_seconds: float) -> None:
         if slot > now:
             return
         try:
-            run_production(config, slot, store=store)
+            prepared = next((
+                item for item in store.jobs(limit=500)
+                if item["status"] == "PREPARED"
+                and item["report"].get("preparation_status") == "READY"
+            ), None)
+            if prepared is None:
+                LOG.warning("scheduled %s skipped: no prepared dataset", kind)
+                return
+            run_batch_action(
+                config, prepared["report"].get("batch_id", prepared["batch_id"]), kind,
+                store=store, scheduled_at=slot,
+            )
         except Exception:
-            LOG.exception("scheduled slot %s failed", slot.isoformat())
+            LOG.exception("scheduled %s slot %s failed", kind, slot.isoformat())
 
-    apply_schedule(scheduler, schedule, dispatch)
+    from production.schedule import apply_action_schedules
+
+    apply_action_schedules(scheduler, schedule, dispatch)
     scheduler.start()
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="production-manual")
     manual_future: Future | None = None
@@ -117,7 +144,7 @@ def _serve(config, store, scheduler_factory, poll_seconds: float) -> None:
         while True:
             current_schedule = store.get_schedule(_default_schedule(config))
             if current_schedule != last_schedule:
-                apply_schedule(scheduler, current_schedule, dispatch)
+                apply_action_schedules(scheduler, current_schedule, dispatch)
                 last_schedule = current_schedule
                 LOG.info("schedule updated: %s", current_schedule)
             if manual_future is None or manual_future.done():

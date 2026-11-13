@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -12,6 +13,12 @@ import pandas as pd
 from recsys_vnpt.canonical import historical_behavior_features
 from recsys_vnpt.config import DOMAIN_CONFIGS, get_domain_config
 from recsys_vnpt.source_manifest import schema_hash
+
+
+def temporal_artifact_root(canonical_root: str | Path) -> Path:
+    """Resolve an isolated temporal cache when a manual demo cutoff is active."""
+    configured = os.environ.get("RECSYS_VNPT_TEMPORAL_ROOT")
+    return Path(configured) if configured else Path(canonical_root) / "temporal"
 
 
 TARGET_PAIR_LEAKAGE_COLUMNS = {

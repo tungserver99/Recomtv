@@ -41,6 +41,105 @@ def _delivered(config) -> dict:
     return {name: (directory / name).read_bytes() for name in current["files"]}
 
 
+def test_explicit_model_bundle_is_verified_without_reading_promotion_pointer(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    bundle = tmp_path / "models" / "bundle-42"
+    bundle.mkdir(parents=True)
+    manifest = {
+        "bundle_id": "bundle-42",
+        "data_end_at": "2025-02-14T00:00:00",
+        "serving_cutoff": "2025-02-14T00:00:00",
+    }
+    monkeypatch.setattr(runner, "load_bundle", lambda path: (None, None, manifest))
+    monkeypatch.setattr(runner, "load_bundle_fcn", lambda path, families: {})
+    monkeypatch.setattr(runner, "bundle_identity", lambda manifest: "sha256-bundle-42")
+    config = SimpleNamespace(
+        uses_learned_scorers=True,
+        ordering=SimpleNamespace(fcn_families=()),
+        root=lambda name: (_ for _ in ()).throw(AssertionError("promotion registry should not be read")),
+    )
+
+    selected, info = runner._promoted(config, model_path=bundle)
+
+    assert selected == bundle.resolve()
+    assert info["bundle_id"] == "bundle-42"
+    assert info["model_sha256"] == "sha256-bundle-42"
+    assert info["model_source"] == "explicit"
+    assert info["model_path"] == str(bundle.resolve())
+
+
+def test_retrain_resolves_canonical_path_inside_prepared_data_root(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    config = _config(tmp_path)
+    manifest = SimpleNamespace(
+        fingerprint="input-fingerprint",
+        batch_started_at=datetime(2025, 3, 1, tzinfo=timezone.utc),
+    )
+    prepared_root = Path(config.work_root) / "prepared_artifacts" / "artifact-key"
+    monkeypatch.setattr(runner, "wait_for_ready", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "_validate_input", lambda *args, **kwargs: manifest)
+    monkeypatch.setattr(
+        runner,
+        "load_prepared_dataset",
+        lambda *args, **kwargs: SimpleNamespace(
+            artifact_root=prepared_root,
+            manifest_path=prepared_root / "manifest.json",
+            manifest={"artifact_key": "artifact-key"},
+        ),
+    )
+    import recsys_vnpt.serving as serving
+
+    captured = []
+
+    def stop_after_root_resolution(canonical, *args, **kwargs):
+        captured.append(canonical)
+        raise RuntimeError("stop after canonical path is resolved")
+
+    monkeypatch.setattr(serving, "_interactions_loader", stop_after_root_resolution)
+
+    with pytest.raises(BatchError, match="stop after canonical path is resolved"):
+        runner.run_retrain_batch(config, "b1", run_id="root-path-check")
+
+    assert captured == [prepared_root / "canonical" / config.domain]
+
+
+def test_reusing_a_run_id_with_a_different_cutoff_is_rejected(tmp_path):
+    config = _hand_built(tmp_path)
+
+    def complete(work, status):
+        status.transition("VALIDATING_INPUT")
+        status.transition("LOADING_PREPARED_DATA")
+        status.transition("LOADING_MODEL")
+        status.transition("RUNNING_SHARDS")
+        status.transition("MERGING")
+        status.transition("VALIDATING_OUTPUT")
+        status.transition("PUBLISHING")
+        status.transition("PUBLISHED", data_end_at="2025-02-15T23:59:59")
+        return {"status": "published"}
+
+    runner._run(
+        config,
+        "b1",
+        "inference",
+        complete,
+        run_id="stable-run",
+        expected_details={"data_end_at": "2025-02-15T23:59:59"},
+    )
+
+    with pytest.raises(BatchError, match="different data_end_at"):
+        runner._run(
+            config,
+            "b1",
+            "inference",
+            complete,
+            run_id="stable-run",
+            expected_details={"data_end_at": "2025-02-16T23:59:59"},
+        )
+
+
 def test_retrain_then_inference_commits_a_valid_three_file_delivery(tmp_path):
     write_smoke_batch(tmp_path / "incoming", "b1")
     config = _config(tmp_path)
@@ -66,9 +165,15 @@ def test_retrain_then_inference_commits_a_valid_three_file_delivery(tmp_path):
     assert validation.passed, validation.errors[:3]
     assert validation.metrics["profiles_emitted"] == 30
 
-    again = runner.run_inference_batch(config, "b1")
+    again = runner.run_inference_batch(config, "b1", run_id=report["run_id"])
     assert again["status"] == "already_done"
     assert read_current_delivery(config.delivery_root)["generation"] == report["generation"]
+
+    repeated = runner.run_inference_batch(config, "b1")
+    assert repeated["status"] == "published"
+    assert repeated["run_id"] != report["run_id"]
+    assert repeated["generation"] != report["generation"]
+    assert read_current_delivery(config.delivery_root)["run_id"] == repeated["run_id"]
 
 
 def test_inference_never_fits_a_missing_model(tmp_path):
@@ -103,14 +208,15 @@ def test_a_rerun_recomputes_only_the_shards_that_do_not_verify(tmp_path, monkeyp
         raise OSError("disk went away")
 
     monkeypatch.setattr(runner, "merge_shards", failing_merge)
+    run_id = "retry-merge"
     with pytest.raises(BatchError, match="OUTPUT_INVALID"):
-        runner.run_inference_batch(config, "b1")
+        runner.run_inference_batch(config, "b1", run_id=run_id)
     assert read_current_delivery(config.delivery_root) is None
 
-    shard = Path(config.work_root) / "batches" / "b1" / "inference" / "shards" / "shard_00001"
+    shard = Path(config.work_root) / "batches" / "b1" / "inference" / "runs" / run_id / "shards" / "shard_00001"
     (shard / "rule_content.txt").write_text("corrupted\n", encoding="utf-8")
     monkeypatch.setattr(runner, "merge_shards", real_merge)
-    report = runner.run_inference_batch(config, "b1")
+    report = runner.run_inference_batch(config, "b1", run_id=run_id)
     assert report["status"] == "published"
     assert report["shards_reused"] == config.num_shards - 1
 

@@ -88,6 +88,7 @@ from recsys_vnpt.temporal import (
     build_pair_features,
     historical_profile_features,
     load_temporal_windows,
+    temporal_artifact_root,
 )
 from typing import Any
 
@@ -562,7 +563,7 @@ def _serving_candidates_for_evaluation(
     feature_frame["fallback"] = False
 
     seen_profiles, seen_contents, seen_metrics = _evaluation_seen_entities(
-        canonical / "temporal", evaluation_split
+        temporal_artifact_root(canonical), evaluation_split
     )
     if seen_profiles or seen_contents:
         feature_frame["observed_history_profile_oov"] = ~feature_frame[
@@ -1322,7 +1323,7 @@ def evaluate_popularity_baseline(
         raise ValueError(f"unsupported baseline family: {baseline_family}")
     root = Path(project_root).resolve()
     canonical = data_artifact_path("canonical", domain, project_root=root)
-    temporal = canonical / "temporal"
+    temporal = temporal_artifact_root(canonical)
     truth_candidates, evaluation_cutoff, selection_metrics = _evaluation_truth_selection(
         temporal,
         evaluation_split,

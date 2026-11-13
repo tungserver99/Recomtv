@@ -362,3 +362,108 @@ def run_production(
         elif lock is not None:
             lock.__exit__(None, None, None)
 
+
+def run_batch_action(
+    config: ProductionConfig,
+    batch_id: str,
+    kind: str,
+    *,
+    store: StateStore | None = None,
+    scheduled_at: datetime | None = None,
+    data_end_at: str | None = None,
+    run_id: str | None = None,
+    model_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Run only one already-prepared batch operation through Batch CLI logic."""
+    import uuid
+    from dataclasses import replace
+
+    if kind not in {"prepare", "retrain", "inference"}:
+        raise ValueError("kind must be prepare, retrain or inference")
+    if kind == "prepare":
+        raise ValueError("Prepare Data uses run_production(..., prepare_only=True)")
+
+    state = store or StateStore(config.database_path)
+    run_id = run_id or uuid.uuid4().hex
+    slot = scheduled_at or datetime.now(timezone.utc)
+    selected_data_root = state.get_data_root(config.data_root)
+    source_config = replace(config, data_root=config.resolve_data_root(selected_data_root))
+    batch_config = source_config.batch
+    data_settings = state.get_data_settings({
+        name: getattr(batch_config, name) for name in (
+            "time_train", "time_valid", "time_test", "max_profiles", "gate_evaluation_profiles"
+        )
+    })
+    batch_config = replace(batch_config, **data_settings)
+
+    from recsys_vnpt import batch_runner
+
+    manifest = batch_runner._validate_input(batch_config, batch_id, verify_checksums=False)
+    job_key = f"{batch_id}--{run_id}"
+    report: dict[str, Any] = {
+        "batch_id": batch_id,
+        "run_id": run_id,
+        "kind": kind,
+        "mode": "Manual" if data_end_at else "Automatic",
+        "data_end_at": data_end_at,
+        "batch_started_at": manifest.batch_started_at.isoformat(),
+        "actual_start": datetime.now(timezone.utc).isoformat(),
+        "actual_end": None,
+        "status": "PENDING",
+        "data_settings": data_settings,
+        "input_fingerprint": manifest.fingerprint,
+        "output_files": {},
+    }
+    lock = BatchLock(config.work_root / "locks", "production-global")
+    lock.__enter__()
+    claimed = False
+    try:
+        if not state.try_start_job(job_key, slot, manifest.batch_started_at):
+            raise BatchError("BATCH_LOCKED", "another production job is active")
+        claimed = True
+        report["status"] = "RUNNING"
+        state.update_job(job_key, report, "RUNNING")
+        if kind == "retrain":
+            result = batch_runner.run_retrain_batch(
+                batch_config, batch_id, data_end_at, run_id=run_id
+            )
+            report["retrain_result"] = result
+            report["model_used"] = "NEWLY_PROMOTED"
+            report["model_bundle_id"] = Path(str(result.get("bundle", ""))).name or None
+            report["quality_gate_result"] = result.get("gate", {}).get("passed", "UNKNOWN")
+        else:
+            result = batch_runner.run_inference_batch(
+                batch_config, batch_id, data_end_at, run_id=run_id, model_path=model_path
+            )
+            report["inference_result"] = result
+            report["serving_cutoff"] = result.get("serving_cutoff")
+            report["model_bundle_id"] = result.get("bundle_id")
+            report["output_generation"] = result.get("generation")
+            report["output_files"] = result.get("files", {})
+            report["output_location"] = str(config.delivery_root / "generations" / str(result.get("generation", "")))
+            report["model_used"] = result.get("bundle_id")
+        report["status"] = "COMPLETED"
+        return report
+    except Exception as error:
+        report["status"] = "FAILED"
+        report["error_code"] = getattr(error, "code", type(error).__name__)
+        report["error_message"] = getattr(error, "message", str(error))
+        raise
+    finally:
+        report["actual_end"] = datetime.now(timezone.utc).isoformat()
+        report["duration_seconds"] = (
+            datetime.fromisoformat(report["actual_end"])
+            - datetime.fromisoformat(report["actual_start"])
+        ).total_seconds()
+        report_path = config.work_root / "batches" / batch_id / kind / "runs" / run_id / "dashboard_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(report_path, json.dumps(report, indent=2, sort_keys=True, default=str))
+        if claimed:
+            state.finish_job(
+                job_key, report,
+                status="SUCCESS" if report["status"] == "COMPLETED" else "FAILED",
+                error_code=report.get("error_code"),
+                error_message=report.get("error_message"),
+            )
+        lock.__exit__(None, None, None)
+

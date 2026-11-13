@@ -6,17 +6,89 @@ from recsys_vnpt.canonical import (
     canonicalize_behavior_events,
     canonicalize_content_tags,
     canonicalize_contents,
+    interaction_partitions_through,
     historical_behavior_features,
     historical_behavior_features_from_parts,
     normalize_identifier,
     normalize_user_metadata,
     normalize_username,
+    normalize_data_end_at,
+    read_partitioned_interactions_until,
 )
 from recsys_vnpt.temporal import deterministic_negative_samples, evaluation_candidates
+from recsys_vnpt.temporal import temporal_artifact_root
 from recsys_vnpt.pipeline_v2 import (
     _evaluation_truth_selection,
     _interaction_catalog_audit,
 )
+
+
+def test_manual_cutoff_requires_timezone_and_preserves_local_wall_time():
+    import pytest
+
+    assert normalize_data_end_at("2025-02-15T23:59:59+07:00") == pd.Timestamp(
+        "2025-02-15 23:59:59"
+    )
+    with pytest.raises(ValueError, match="timezone offset"):
+        normalize_data_end_at("2025-02-15 23:59:59")
+
+
+def test_manual_temporal_cache_uses_the_configured_isolated_root(tmp_path, monkeypatch):
+    canonical = tmp_path / "canonical"
+    isolated = tmp_path / "temporal" / "cutoff-20250215"
+    monkeypatch.setenv("RECSYS_VNPT_TEMPORAL_ROOT", str(isolated))
+
+    assert temporal_artifact_root(canonical) == isolated
+
+
+def test_partition_selection_does_not_open_dates_after_manual_cutoff(tmp_path):
+    root = tmp_path / "interactions_by_date"
+    for day in ("2025-02-15", "2025-02-16", "2025-02-20"):
+        part = root / f"event_date={day}" / "part-00000.parquet"
+        part.parent.mkdir(parents=True)
+        part.touch()
+
+    selected, available = interaction_partitions_through(
+        root, "2025-02-16T10:30:00+07:00"
+    )
+
+    assert available == 3
+    assert [path.parent.name for path in selected] == [
+        "event_date=2025-02-15", "event_date=2025-02-16"
+    ]
+
+
+def test_manual_cutoff_prunes_later_partitions_and_filters_within_day(tmp_path):
+    import pytest
+    pl = pytest.importorskip("polars")
+
+    parts = tmp_path / "interactions_by_date"
+    for date, rows in {
+        "2025-02-15": [
+            ("p1", "2025-02-15 12:00:00"),
+            ("p2", "2025-02-15 23:59:59"),
+        ],
+        "2025-02-16": [("p3", "2025-02-16 00:00:00")],
+    }.items():
+        partition = parts / f"event_date={date}"
+        partition.mkdir(parents=True)
+        pl.DataFrame(
+            {
+                "profile_id": [row[0] for row in rows],
+                "content_id": ["c1"] * len(rows),
+                "create_date": [row[1] for row in rows],
+                "duration": [10] * len(rows),
+            }
+        ).with_columns(pl.col("create_date").str.to_datetime()).write_parquet(
+            partition / "part-00000.parquet"
+        )
+
+    loaded = read_partitioned_interactions_until(
+        parts, "2025-02-15T23:59:58+07:00"
+    )
+
+    assert loaded["profile_id"].tolist() == ["p1"]
+    assert len(list(parts.glob("event_date=*/part-*.parquet"))) == 2
 
 
 def test_identifier_normalization_removes_only_numeric_float_artifacts():

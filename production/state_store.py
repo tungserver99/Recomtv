@@ -59,6 +59,7 @@ class StateStore:
                     request_id TEXT PRIMARY KEY,
                     batch_id TEXT NOT NULL,
                     kind TEXT NOT NULL DEFAULT 'production',
+                    data_end_at TEXT,
                     slot TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'PENDING',
@@ -92,6 +93,8 @@ class StateStore:
                 connection.execute(
                     "ALTER TABLE requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'production'"
                 )
+            if "data_end_at" not in request_columns:
+                connection.execute("ALTER TABLE requests ADD COLUMN data_end_at TEXT")
             job_columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
             if "data_cutoff" in job_columns and "batch_started_at" not in job_columns:
                 connection.executescript(
@@ -212,12 +215,19 @@ class StateStore:
                 (_encode(values), _now()),
             )
 
-    def enqueue_request(self, slot: datetime, kind: str = "production") -> str:
+    def enqueue_request(
+        self,
+        slot: datetime,
+        kind: str = "production",
+        *,
+        batch_id: str | None = None,
+        data_end_at: str | None = None,
+    ) -> str:
         if slot.tzinfo is None:
             raise ValueError("request slot must be timezone-aware")
-        if kind not in {"production", "prepare"}:
-            raise ValueError("request kind must be production or prepare")
-        batch_id = slot.strftime("%Y%m%d_%H%M")
+        if kind not in {"production", "prepare", "retrain", "inference"}:
+            raise ValueError("request kind must be production, prepare, retrain or inference")
+        batch_id = batch_id or slot.strftime("%Y%m%d_%H%M")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
@@ -238,8 +248,8 @@ class StateStore:
                 return queued["request_id"]
             request_id = uuid.uuid4().hex
             connection.execute(
-                "INSERT INTO requests(request_id,batch_id,kind,slot,created_at,status) VALUES(?,?,?,?,?, 'PENDING')",
-                (request_id, batch_id, kind, slot.isoformat(), _now()),
+                "INSERT INTO requests(request_id,batch_id,kind,data_end_at,slot,created_at,status) VALUES(?,?,?,?,?,?, 'PENDING')",
+                (request_id, batch_id, kind, data_end_at, slot.isoformat(), _now()),
             )
             connection.commit()
             return request_id
@@ -259,6 +269,14 @@ class StateStore:
             )
             connection.commit()
             return dict(row)
+
+    def queued_requests(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM requests WHERE status IN ('PENDING','CLAIMED') ORDER BY created_at LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def finish_request(self, request_id: str, error: str | None = None) -> None:
         with self._connect() as connection:

@@ -23,7 +23,7 @@ from scipy import sparse
 
 from recsys_vnpt.gbdt import head_device, make_head
 from recsys_vnpt.orderings import reciprocal_rank, rrf_fuse
-from recsys_vnpt.temporal import load_temporal_windows
+from recsys_vnpt.temporal import load_temporal_windows, temporal_artifact_root
 
 
 GAIN_COLUMNS = ("completion_gain", "watch_time_gain")
@@ -650,7 +650,7 @@ def _training_windows(canonical: Path, evaluation_split: str) -> list[Any]:
     serving (the locked untouched-test refit protocol)."""
     if evaluation_split not in {"validation", "test"}:
         raise ValueError("content scorer split must be validation or test")
-    windows = load_temporal_windows(canonical / "temporal")
+    windows = load_temporal_windows(temporal_artifact_root(canonical))
     return list(windows[: 4 if evaluation_split == "test" else 3])
 
 
@@ -696,7 +696,7 @@ def fit_content_scorer(
     sampler_counters: dict[str, int] = {}
     for window in windows:
         scope = window_scopes[window.name]
-        positives = _window_positives(canonical / "temporal" / f"{window.name}.parquet")
+        positives = _window_positives(temporal_artifact_root(canonical) / f"{window.name}.parquet")
         positives = positives[positives["content_id"].isin(scope.index)]
         if positives.empty:
             continue

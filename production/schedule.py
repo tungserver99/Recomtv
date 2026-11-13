@@ -51,3 +51,38 @@ def apply_schedule(scheduler, schedule: dict, callback: Callable[[str], None]) -
             misfire_grace_time=1,
         )
 
+
+def apply_action_schedules(scheduler, schedule: dict, callback: Callable[[str, str], None]) -> None:
+    """Install independent cron jobs for retrain and inference."""
+    desired = {}
+    if schedule.get("enabled"):
+        timezone = ZoneInfo(schedule["timezone"])
+        for kind in ("retrain", "inference"):
+            values = schedule.get(f"{kind}_run_times")
+            if values is None and kind == "inference":
+                values = schedule.get("run_times", [])
+            for value in (validate_run_times(values) if values else ()):
+                hour, minute = map(int, value.split(":"))
+                job_id = f"production-{kind}-{hour:02d}{minute:02d}"
+                desired[job_id] = (kind, value, hour, minute, timezone)
+    existing = {
+        job.id for job in scheduler.get_jobs()
+        if job.id.startswith("production-")
+    }
+    for job_id in existing - set(desired):
+        scheduler.remove_job(job_id)
+    for job_id, (kind, value, hour, minute, timezone) in desired.items():
+        scheduler.add_job(
+            callback,
+            trigger="cron",
+            hour=hour,
+            minute=minute,
+            timezone=timezone,
+            args=[kind, value],
+            id=job_id,
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=1,
+        )
+

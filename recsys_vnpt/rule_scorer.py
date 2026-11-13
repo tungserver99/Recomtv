@@ -17,7 +17,7 @@ import pandas as pd
 
 from recsys_vnpt.canonical import select_content_metadata_as_of
 from recsys_vnpt.gbdt import head_device, make_head
-from recsys_vnpt.temporal import load_temporal_windows
+from recsys_vnpt.temporal import load_temporal_windows, temporal_artifact_root
 
 
 GAIN_COLUMNS = ("completion_gain", "watch_time_gain")
@@ -341,7 +341,7 @@ def training_windows(canonical: Path, evaluation_split: str) -> list[Any]:
     if evaluation_split not in {"validation", "test"}:
         raise ValueError("rule scorer split must be validation or test")
     return list(
-        load_temporal_windows(canonical / "temporal")[
+        load_temporal_windows(temporal_artifact_root(canonical))[
             : 4 if evaluation_split == "test" else 3
         ]
     )
@@ -384,7 +384,7 @@ def fit_rule_scorer(
     for window in windows:
         window_membership, window_rules, _, _ = window_scopes[window.name]
         targets = window_targets(
-            canonical / "temporal" / f"{window.name}.parquet",
+            temporal_artifact_root(canonical) / f"{window.name}.parquet",
             window_membership,
             window_rules,
         )
